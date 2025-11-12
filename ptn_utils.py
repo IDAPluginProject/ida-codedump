@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set, Iterable
+from typing import Dict, List, Optional, Tuple, Set
 
 ConfT = str  # 'low' | 'med' | 'high'
 
@@ -40,6 +41,7 @@ class GlobalAccess:
     off: Optional[int]             # byte offset into global, if known
     length: Optional[int]          # byte length, if known
     kind: str                      # 'R' or 'W'
+    cs_ea: int = 0                 # code-site EA for this access (per-instruction correlation)
 
 @dataclass
 class FunctionSummary:
@@ -283,7 +285,7 @@ class PTNEmitter:
                     meta: Dict[str, object]) -> str:
         fid = self._fid(fea)
         m = dict(meta)
-        if idx < 0 and name:
+        if name:
             m["name"] = name
         if kind == "L":
             return self._fmt_node_L(fid, max(idx, -1), off, length, mode, cast, name, m)
@@ -341,3 +343,135 @@ class PTNEmitter:
 
             out[fea] = "\n".join(lines) + ("\n" if lines else "")
         return out
+
+    def per_instruction_hints(self, callee_depth: int = 1) -> Dict[int, Dict[int, List[str]]]:
+        """
+        Returns mapping: func_ea -> (ea -> [hint line (without comment prefix)]).
+        Hints include:
+          - E: origin -> A(Fcallee,arg)  (+ optional chaining if callee_depth > 1)
+          - G: F(Fid) -> G(0xEA) and G(0xEA) -> F(Fid) at the access site
+        """
+        hints: Dict[int, Dict[int, List[str]]] = {}
+        param_forward = self._build_param_forward()
+
+        # Callsites
+        for fea, fs in self.summaries.items():
+            for au in fs.arguses:
+                if not au.cs_ea or au.callee_ea is None:
+                    continue
+                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast,
+                                          {"conf": au.conf})
+                fid_to = self._fid(au.callee_ea)
+                line0 = f"@PTN E:{origin} -> {self._fmt_node_A(fid_to, au.arg_index)}"
+                hints.setdefault(fea, {}).setdefault(au.cs_ea, []).append(line0)
+
+                if callee_depth > 1 and au.base_kind in ("L", "P"):
+                    frontier: List[Tuple[int, int, int]] = [(au.callee_ea, au.arg_index, 1)]
+                    depth_seen: Set[Tuple[int, int]] = set()
+                    while frontier:
+                        cur_fea, pidx, depth = frontier.pop()
+                        if depth >= callee_depth:
+                            continue
+                        key = (cur_fea, pidx)
+                        if key in depth_seen:
+                            continue
+                        depth_seen.add(key)
+                        for (next_callee_ea, next_argk, meta) in param_forward.get(key, []):
+                            fid_mid = self._fid(cur_fea)
+                            fid_next = self._fid(next_callee_ea)
+                            hints.setdefault(fea, {}).setdefault(au.cs_ea, []).append(
+                                f"@PTN E:{origin} -> A({fid_mid},{pidx}) -> A({fid_next},{next_argk})"
+                            )
+                            frontier.append((next_callee_ea, next_argk, depth + 1))
+
+        # Globals at instruction sites
+        for fea, fs in self.summaries.items():
+            fid = self._fid(fea)
+            for ga in fs.globals:
+                if not ga.cs_ea:
+                    continue
+                if ga.kind == "W":
+                    line = f"@PTN G:{self._fmt_node_F(fid)} -> {self._fmt_node_G(ga.ea, ga.off, ga.length)}"
+                else:
+                    line = f"@PTN G:{self._fmt_node_G(ga.ea, ga.off, ga.length)} -> {self._fmt_node_F(fid)}"
+                hints.setdefault(fea, {}).setdefault(ga.cs_ea, []).append(line)
+
+        return hints
+
+    def emit_ptn_json(self, start_eas: Set[int], callee_depth: int, restrict_eas: Optional[Set[int]] = None) -> str:
+        """
+        JSON representation designed for programmatic/LLM consumption.
+        """
+        target_set = sorted(list(restrict_eas or start_eas or set(self.summaries.keys())))
+        param_forward = self._build_param_forward()
+        incoming_map = self._build_incoming_map()
+
+        obj: Dict[str, object] = {
+            "version": "0",
+            "dict": [{"fid": self._fid(ea), "ea": f"0x{ea:X}", "name": self._name_by_ea.get(ea, "")} for ea in target_set],
+            "aliases": [],
+            "calls": [],
+            "globals": [],
+            "inbound": []
+        }
+
+        # Aliases
+        for fea in target_set:
+            fs = self.summaries.get(fea)
+            if not fs:
+                continue
+            fid = self._fid(fea)
+            for al in fs.aliases:
+                obj["aliases"].append({
+                    "func": {"fid": fid, "ea": f"0x{fea:X}"},
+                    "dst": {"kind": al.dst_kind, "id": al.dst_id, "name": al.dst_name},
+                    "src": {"kind": al.src_kind, "id": al.src_id, "name": al.src_name,
+                            "off": al.off, "len": al.length, "mode": al.mode, "cast": al.cast},
+                    "conf": al.conf
+                })
+
+        # Calls
+        for fea in target_set:
+            fs = self.summaries.get(fea)
+            if not fs:
+                continue
+            for au in fs.arguses:
+                if au.callee_ea is None:
+                    continue
+                obj["calls"].append({
+                    "caller": {"fid": self._fid(fea), "ea": f"0x{fea:X}"},
+                    "cs_ea": f"0x{au.cs_ea:X}" if au.cs_ea else None,
+                    "origin": {"kind": au.base_kind, "id": au.base_id, "name": au.base_name,
+                               "off": au.off, "len": au.length, "mode": au.mode, "cast": au.cast, "conf": au.conf},
+                    "callee": {"fid": self._fid(au.callee_ea), "ea": f"0x{au.callee_ea:X}"},
+                    "arg_index": au.arg_index
+                })
+
+        # Globals
+        for fea in target_set:
+            fs = self.summaries.get(fea)
+            if not fs:
+                continue
+            for ga in fs.globals:
+                obj["globals"].append({
+                    "func": {"fid": self._fid(fea), "ea": f"0x{fea:X}"},
+                    "op": ga.kind,
+                    "global_ea": f"0x{ga.ea:X}",
+                    "off": ga.off, "len": ga.length,
+                    "cs_ea": f"0x{ga.cs_ea:X}" if ga.cs_ea else None
+                })
+
+        # Inbound
+        for (callee_ea, pidx), entries in incoming_map.items():
+            if callee_ea not in target_set:
+                continue
+            for ent in entries:
+                obj["inbound"].append({
+                    "to": {"fid": self._fid(callee_ea), "ea": f"0x{callee_ea:X}", "param": pidx},
+                    "from": {"fid": self._fid(ent["caller_ea"]), "ea": f"0x{ent['caller_ea']:X}"},
+                    "origin": {"kind": ent["origin_kind"], "id": ent["origin_id"], "name": ent["origin_name"],
+                               "off": ent["off"], "len": ent["length"], "mode": ent["mode"], "cast": ent["cast"], "conf": ent["conf"]},
+                    "cs_ea": f"0x{ent['cs_ea']:X}" if ent["cs_ea"] else None
+                })
+
+        return json.dumps(obj, indent=2) + "\n"

@@ -218,38 +218,14 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                 off=off, length=length, mode=mode or "&", cast=cast, conf="med"
             ))
 
-    def _extract_callee_ea(self, x) -> Optional[int]:
-        try:
-            y = x
-            # peel casts
-            while y and y.op == ida_hexrays.cot_cast:
-                y = y.x
-            if not y:
-                return None
-            # direct call to function address/object
-            if y.op == ida_hexrays.cot_obj:
-                return int(y.obj_ea)
-            # helper name (e.g., "strcpy")
-            if y.op == ida_hexrays.cot_helper:
-                h = getattr(y, "helper", None)
-                if h:
-                    ea = ida_name.get_name_ea(idaapi.BADADDR, h)
-                    if ea != idaapi.BADADDR:
-                        return int(ea)
-                return None
-            # function pointer variable; cannot resolve statically here
-            return None
-        except Exception:
-            return None
-
-    def _record_global_write_from_lvalue(self, lhs):
+    def _record_global_write_from_lvalue(self, lhs, cs_ea: int):
         cur = lhs
         off = 0
         try:
             while cur:
                 if cur.op == ida_hexrays.cot_obj:
                     gea = int(cur.obj_ea)
-                    self.fs.globals.append(GlobalAccess(ea=gea, off=(off if off else None), length=None, kind="W"))
+                    self.fs.globals.append(GlobalAccess(ea=gea, off=(off if off else None), length=None, kind="W", cs_ea=cs_ea or 0))
                     return
                 if cur.op == ida_hexrays.cot_memptr:
                     off += int(cur.m)
@@ -265,7 +241,7 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
         except Exception:
             return
 
-    def _record_global_read_from_expr(self, e):
+    def _record_global_read_from_expr(self, e, cs_ea: int):
         cur = e
         seen = set()
         stack = [cur]
@@ -277,7 +253,7 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                 seen.add(id(cur))
                 if cur.op == ida_hexrays.cot_obj:
                     gea = int(cur.obj_ea)
-                    self.fs.globals.append(GlobalAccess(ea=gea, off=None, length=None, kind="R"))
+                    self.fs.globals.append(GlobalAccess(ea=gea, off=None, length=None, kind="R", cs_ea=cs_ea or 0))
                 for ch in (getattr(cur, "x", None), getattr(cur, "y", None), getattr(cur, "z", None)):
                     if ch is not None:
                         stack.append(ch)
@@ -293,16 +269,41 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                 for k in range(argc):
                     arg = e.a[k]
                     self._record_arguse(call_ea, callee_ea, k, arg)
+                # Also treat the call expression as a read (e.g., for global function pointers used inside arguments)
+                self._record_global_read_from_expr(e, call_ea)
                 return 0
             if e.op == ida_hexrays.cot_asg:
-                self._record_global_write_from_lvalue(e.x)
+                a_ea = int(e.ea) if e.ea else 0
+                self._record_global_write_from_lvalue(e.x, a_ea)
                 self._record_alias(e.x, e.y)
-                self._record_global_read_from_expr(e.y)
+                self._record_global_read_from_expr(e.y, a_ea)
                 return 0
-            self._record_global_read_from_expr(e)
+            # Fallback read extraction on other expressions
+            eea = int(e.ea) if e.ea else 0
+            self._record_global_read_from_expr(e, eea)
         except Exception:
             pass
         return 0
+
+    def _extract_callee_ea(self, x) -> Optional[int]:
+        try:
+            y = x
+            while y and y.op == ida_hexrays.cot_cast:
+                y = y.x
+            if not y:
+                return None
+            if y.op == ida_hexrays.cot_obj:
+                return int(y.obj_ea)
+            if y.op == ida_hexrays.cot_helper:
+                h = getattr(y, "helper", None)
+                if h:
+                    ea = ida_name.get_name_ea(idaapi.BADADDR, h)
+                    if ea != idaapi.BADADDR:
+                        return int(ea)
+                return None
+            return None
+        except Exception:
+            return None
 
 def analyze_functions_ctree(func_eas) -> Dict[int, FunctionSummary]:
     out: Dict[int, FunctionSummary] = {}
@@ -319,12 +320,9 @@ def analyze_functions_ctree(func_eas) -> Dict[int, FunctionSummary]:
             continue
         v = _ProvCollector(cfunc)
         try:
-            # Proper traversal across the ctree; IDA versions differ in helpers exposed,
-            # but 'apply_to' is stable across supported versions.
             v.apply_to(cfunc.body, None)
         except Exception:
             try:
-                # Fallback for older builds
                 cfunc.body.visit_exprs(v)
             except Exception:
                 pass

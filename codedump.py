@@ -10,6 +10,10 @@ Summary:
   2) Generate DOT graphs of the call graph.
   3) Generate PTN files describing dataflow provenance (locals/params/globals) across calls, including
      aliasing (e.g., &a1[123]) and global write→read relationships.
+  4) Dump assembly for function(s) with callers/callees/refs in the same order & layout as the decompiled
+     dump, including the same PTN annotations & xref summaries.
+  5) Inject per-instruction @PTN hints inline in assembly by correlating callsites and global touches
+     back to item EAs. (Uses CTREE to collect callsite EAs and expression EAs for global touches.)
 
 Requirements:
   - IDA Pro 7.6+
@@ -32,6 +36,7 @@ import ida_idp
 import ida_segment
 import ida_ida
 import ida_gdl
+import ida_lines
 
 import threading
 import os
@@ -41,7 +46,7 @@ import traceback
 import time
 import re
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Dict, Set, List, Tuple
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
@@ -69,6 +74,11 @@ ACTION_ID_PTN_COPY_CTX = "codedumper:copy_ptn_var_ctx"
 ACTION_LABEL_PTN_COPY_CTX = "Copy PTN for Identifier Under Cursor"
 ACTION_TOOLTIP_PTN_COPY_CTX = "Copy provenance lines for identifier under cursor"
 
+# Assembly dump actions (single & multi)
+ACTION_ID_ASM_CTX = "codedumper:dump_asm_ctx"
+ACTION_LABEL_ASM_CTX = "Dump Assembly + Callers/Callees/Refs..."
+ACTION_TOOLTIP_ASM_CTX = "Disassemble current function, callers, callees, and referenced functions to an ASM file"
+
 MENU_PATH_CTX = "Dump code/"
 
 ACTION_ID_CODE_MULTI = "codedumper:dump_code_multi"
@@ -80,6 +90,9 @@ ACTION_TOOLTIP_DOT_MULTI = "Generate DOT graph for a list of functions and their
 ACTION_ID_PTN_MULTI = "codedumper:generate_ptn_multi"
 ACTION_LABEL_PTN_MULTI = "Generate PTN for Multiple Functions..."
 ACTION_TOOLTIP_PTN_MULTI = "Generate PTN for a list of functions and their combined callers/callees/refs"
+ACTION_ID_ASM_MULTI = "codedumper:dump_asm_multi"
+ACTION_LABEL_ASM_MULTI = "Dump Assembly for Multiple Functions..."
+ACTION_TOOLTIP_ASM_MULTI = "Disassemble a list of functions and their combined callers/callees/refs to an ASM file"
 
 MENU_PATH_MULTI = f"Edit/{PLUGIN_NAME}/"
 
@@ -380,6 +393,68 @@ def decompile_functions_main(eas_to_decompile):
             traceback.print_exc()
     return results
 
+def disassemble_functions_main(eas_to_disasm) -> Dict[int, List[Tuple[str, int, str]]]:
+    """
+    Disassemble the functions identified by 'eas_to_disasm' and return a dict:
+      ea -> list of tuples (kind, ea, text) where kind ∈ {'label','inst'}.
+    For 'label' entries, 'ea' is the address of the label (0 for function header label).
+    For 'inst' entries, 'ea' is the instruction EA, and 'text' is the disassembly for that item.
+    Runs in the IDA main thread via execute_sync (caller responsibility).
+    """
+    results: Dict[int, List[Tuple[str, int, str]]] = {}
+    total = len(eas_to_disasm)
+    count = 0
+    sorted_eas_list = sorted(list(eas_to_disasm))
+    for func_ea in sorted_eas_list:
+        count += 1
+        func_name = ida_name.get_name(func_ea) or f"sub_{func_ea:X}"
+        ida_kernwin.replace_wait_box(f"Disassembling {count}/{total}: {func_name}")
+        func = ida_funcs.get_func(func_ea)
+        if not func:
+            results[func_ea] = [("label", 0, f"; Disassembly FAILED for {func_name} (0x{func_ea:X}) - no function at address")]
+            continue
+        lines: List[Tuple[str, int, str]] = []
+        # Emit a function header label for readability in the ASM body.
+        lines.append(("label", 0, f"{func_name}:"))
+        try:
+            for ea in idautils.FuncItems(func_ea):
+                # Insert a local label if this address has a visible name (e.g., 'loc_...' labels).
+                try:
+                    lab = ida_name.get_name(ea) or ""
+                except Exception:
+                    lab = ""
+                if lab and ea != func_ea:
+                    lines.append(("label", ea, f"{lab}:"))
+                # Preferred disassembly line generation (with tag removal).
+                s = None
+                try:
+                    s = ida_lines.generate_disasm_line(ea, 0)
+                    if s:
+                        try:
+                            s = ida_lines.tag_remove(s)
+                        except Exception:
+                            pass
+                except Exception:
+                    s = None
+                if not s:
+                    try:
+                        s = idc.GetDisasm(ea)
+                    except Exception:
+                        s = None
+                if not s:
+                    try:
+                        item_sz = idc.get_item_size(ea) or 1
+                    except Exception:
+                        item_sz = 1
+                    bytes_repr = " ".join(f"{ida_bytes.get_wide_byte(ea+i):02X}" for i in range(item_sz))
+                    s = f"db {bytes_repr}"
+                lines.append(("inst", ea, s))
+        except Exception:
+            traceback.print_exc()
+            lines.append(("label", 0, "; ERROR: Exception during disassembly traversal"))
+        results[func_ea] = lines
+    return results
+
 def get_edge_style(reasons_set):
     if 'virtual_call' in reasons_set:
         return "bold"
@@ -553,6 +628,188 @@ def write_code_file(output_file_path, decompiled_results, start_func_eas, caller
         ida_kernwin.execute_ui_requests([lambda msg=error_msg: ida_kernwin.warning(msg)])
         return 0
 
+def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int, str]]],
+                   start_func_eas, caller_depth, callee_depth, edges,
+                   fs_summaries: Dict[int, FunctionSummary], max_chars=0):
+    """
+    Write an ASM dump mirroring the structure & ordering of write_code_file.
+    Inject per-instruction @PTN hints inline (as trailing // comments or separate comment lines).
+    """
+    num_funcs_written = 0
+    try:
+        name_map_container = [{}]
+        eas_to_get_names = list(asm_results.keys())
+
+        def get_names_main(eas, container):
+            names = {}
+            for ea in eas:
+                names[ea] = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
+            container[0] = names
+            return 1
+
+        sync_status = ida_kernwin.execute_sync(lambda: get_names_main(eas_to_get_names, name_map_container), ida_kernwin.MFF_READ)
+        name_map = name_map_container[0] if sync_status == 1 else {ea: f"sub_{ea:X}" for ea in eas_to_get_names}
+
+        all_nodes = set(asm_results.keys())
+
+        _augment_edges_with_ctree_calls(fs_summaries, edges)
+
+        out_degrees = [(len(edges[ea]), ea) for ea in all_nodes]
+        sorted_out_degrees = sorted(out_degrees, key=lambda x: (x[0], x[1]))
+        sorted_eas = [t[1] for t in sorted_out_degrees]
+
+        ptn = PTNEmitter(fs_summaries)
+        per_func_ann = ptn.per_function_annotations(max(1, callee_depth))
+        # Per-instruction hints: fea -> {ea -> [hint_str_without_comment_prefix]}
+        per_inst_hints = ptn.per_instruction_hints(max(1, callee_depth))
+
+        def format_asm_with_hints(func_ea: int, items: List[Tuple[str, int, str]]) -> str:
+            lines_out: List[str] = []
+            hint_map = per_inst_hints.get(func_ea, {})
+            for kind, ea, text in items:
+                if kind == "label":
+                    lines_out.append(text)
+                    continue
+                # 'inst' line
+                line = f"0x{ea:X}: {text}"
+                hints = hint_map.get(ea, [])
+                if hints:
+                    # Emit instruction, then per-hint short comment lines for readability
+                    lines_out.append(line)
+                    for h in hints:
+                        lines_out.append(f"    // {h}")
+                else:
+                    lines_out.append(line)
+            return "\n".join(lines_out)
+
+        # Prepare blocks (including sizing with max_chars)
+        included_eas = set(all_nodes)
+        removed_eas = set()
+        func_text_cache: Dict[int, str] = {}
+        if max_chars > 0:
+            func_blocks_for_sizing = []
+            for func_ea in sorted_eas:
+                func_name = name_map.get(func_ea, f"sub_{func_ea:X}")
+                incoming = [fr for fr in edges if func_ea in edges[fr]]
+                outgoing = edges[func_ea]
+                ann = per_func_ann.get(func_ea, "")
+                code_text = func_text_cache.setdefault(func_ea, format_asm_with_hints(func_ea, asm_results[func_ea]))
+                block_str = ''.join([
+                    f"// Incoming xrefs for {func_name} (0x{func_ea:X}): {len(incoming)} refs\n",
+                    f"// Outgoing xrefs for {func_name} (0x{func_ea:X}): {len(outgoing)} refs\n",
+                    ann,
+                    f"// --- Function: {func_name}...\n", code_text, "\n// --- End Function...\n\n"
+                ])
+                func_blocks_for_sizing.append({'ea': func_ea, 'block_size': len(block_str), 'code_len': len(code_text)})
+
+            current_size = sum(d['block_size'] for d in func_blocks_for_sizing)
+            if current_size > max_chars:
+                removable = [d for d in func_blocks_for_sizing if d['ea'] not in start_func_eas]
+                removable.sort(key=lambda d: d['code_len'])
+                while current_size > max_chars and removable:
+                    to_remove = removable.pop(0)
+                    included_eas.remove(to_remove['ea'])
+                    removed_eas.add(to_remove['ea'])
+                    current_size -= to_remove['block_size']
+
+        sorted_included_eas = [ea for ea in sorted_eas if ea in included_eas]
+
+        header_lines = []
+        header_lines.append(f"// Assembly dump generated by {PLUGIN_NAME}\n")
+
+        header_lines.append("\n")
+
+        header_lines.append(
+            "// --------\n"
+            "#PTN v0\n"
+            "// @PTN LEGEND\n"
+            "// Nodes: L(F,i)=local i in function F; P(F,i)=param i of F; G(addr)=global at addr; F(Fx)=function Fx.\n"
+            "// Slices: @[off:len] in bytes; '?' unknown; '&' = address-of; '*' = deref; optional cast as :(type).\n"
+            "// A: alias inside function   => A: dst := src[@slice][mode][:cast] {meta}\n"
+            "// I: inbound (caller→this)   => I: origin -> P(F,i) {caller=F?,cs=0x...,conf=...}\n"
+            "// E: outbound (this→callee)  => E: origin -> A(F?,arg) [-> A(F?,arg)...] {cs=0x...,conf=...}\n"
+            "// G: global touch/summary    => G: F(F?) -> G(0xADDR)   or   G: F(writer) -> G(0xADDR) -> F(reader)\n"
+            "// Dictionary entry (per function block): // @PTN D:F?=0xEA,Name\n"
+            "// --------\n"
+        )
+
+        header_lines.append("\n")
+
+        if len(start_func_eas) == 1:
+            start_ea = list(start_func_eas)[0]
+            header_lines.append(f"// Start Function: 0x{start_ea:X} ({name_map.get(start_ea, '')})\n")
+        else:
+            header_lines.append("// Start Functions:\n")
+            for start_ea in sorted(list(start_func_eas)):
+                header_lines.append(f"//   - 0x{start_ea:X} ({name_map.get(start_ea, '')})\n")
+
+        header_lines.append(f"// Caller Depth: {caller_depth}\n")
+        header_lines.append(f"// Callee/Ref Depth: {callee_depth}\n")
+        if max_chars > 0:
+            header_lines.append(f"// Max Characters: {max_chars}\n")
+        header_lines.append(f"// Total Functions Found: {len(all_nodes)}\n")
+        header_lines.append(f"// Included Functions ({len(included_eas)}):\n")
+        for func_ea in sorted_included_eas:
+            func_name = name_map.get(func_ea, f"sub_{func_ea:X}")
+            header_lines.append(f"//   - {func_name} (0x{func_ea:X})\n")
+        if removed_eas:
+            header_lines.append(f"// Removed Functions ({len(removed_eas)}):\n")
+            for func_ea in sorted(removed_eas):
+                func_name = name_map.get(func_ea, f"sub_{func_ea:X}")
+                header_lines.append(f"//   - {func_name} (0x{func_ea:X})\n")
+        else:
+            header_lines.append(f"// Removed Functions: None\n")
+        header_lines.append(f"// {'-'*60}\n\n")
+        header = ''.join(header_lines)
+
+        final_content_blocks = []
+        for func_ea in sorted_included_eas:
+            func_name = name_map.get(func_ea, f"sub_{func_ea:X}")
+            all_incoming = [fr for fr in edges if func_ea in edges[fr]]
+            filtered_incoming = [fr for fr in all_incoming if fr in included_eas]
+            incoming_strs = []
+            for fr in sorted(filtered_incoming):
+                reasons = sorted(edges[fr][func_ea])
+                reason_str = '/'.join(reasons)
+                src_name = name_map.get(fr, f"sub_{fr:X}")
+                incoming_strs.append(f"{src_name} (0x{fr:X}) [{reason_str}]")
+            incoming_line = f"// Incoming xrefs for {func_name} (0x{func_ea:X}): {', '.join(incoming_strs) or 'None'}\n"
+
+            all_outgoing = edges[func_ea]
+            filtered_outgoing = {to: reasons for to, reasons in all_outgoing.items() if to in included_eas}
+            outgoing_strs = []
+            for to in sorted(filtered_outgoing):
+                reasons = sorted(filtered_outgoing[to])
+                reason_str = '/'.join(reasons)
+                dst_name = name_map.get(to, f"sub_{to:X}")
+                outgoing_strs.append(f"{dst_name} (0x{to:X}) [{reason_str}]")
+            outgoing_line = f"// Outgoing xrefs for {func_name} (0x{func_ea:X}): {', '.join(outgoing_strs) or 'None'}\n"
+
+            code_text = func_text_cache.get(func_ea) or format_asm_with_hints(func_ea, asm_results[func_ea])
+            ann = per_func_ann.get(func_ea, "")
+
+            block = [
+                incoming_line,
+                outgoing_line,
+                ann,
+                f"// --- Function: {func_name} (0x{func_ea:X}) ---\n",
+                code_text + "\n",
+                f"// --- End Function: {func_name} (0x{func_ea:X}) ---\n\n"
+            ]
+            final_content_blocks.append(''.join(block))
+
+        content = header + ''.join(final_content_blocks)
+        with open(output_file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        num_funcs_written = len(included_eas)
+        return num_funcs_written
+
+    except Exception as e:
+        traceback.print_exc()
+        error_msg = f"{PLUGIN_NAME}: Error writing ASM file:\n{e}"
+        ida_kernwin.execute_ui_requests([lambda msg=error_msg: ida_kernwin.warning(msg)])
+        return 0
+
 def write_dot_file(output_file_path, edges, all_nodes, start_func_eas, caller_depth, callee_depth):
     num_nodes_written = 0
     try:
@@ -630,7 +887,10 @@ def write_dot_file(output_file_path, edges, all_nodes, start_func_eas, caller_de
 def write_ptn_file(output_file_path, fs_summaries: Dict[int, FunctionSummary], start_func_eas: Set[int], callee_depth: int):
     try:
         emitter = PTNEmitter(fs_summaries)
-        content = emitter.emit_ptn(start_eas=start_func_eas, callee_depth=max(1, callee_depth), restrict_eas=None)
+        if output_file_path.lower().endswith(".json"):
+            content = emitter.emit_ptn_json(start_eas=start_func_eas, callee_depth=max(1, callee_depth), restrict_eas=None)
+        else:
+            content = emitter.emit_ptn(start_eas=start_func_eas, callee_depth=max(1, callee_depth), restrict_eas=None)
         with open(output_file_path, "w", encoding="utf-8") as f:
             f.write(content)
         return len(content)
@@ -763,13 +1023,28 @@ def dump_task(start_func_eas, caller_depth, callee_depth, output_file_path, mode
             ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
             num_written = write_ptn_file(output_file_path, fs_summaries, set(all_nodes), callee_depth=max(1, callee_depth))
 
+        elif mode == 'asm':
+            asm_result_container = [{}]
+            def run_disasm_main(container, eas):
+                try:
+                    container[0] = disassemble_functions_main(eas)
+                    return 1
+                except Exception:
+                    traceback.print_exc()
+                    container[0] = {}
+                    return 0
+            sync_status = ida_kernwin.execute_sync(lambda: run_disasm_main(asm_result_container, all_nodes), ida_kernwin.MFF_READ)
+            asm_results = asm_result_container[0] if sync_status == 1 else {}
+            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            num_written = write_asm_file(output_file_path, asm_results, start_func_eas, caller_depth, callee_depth, edges, fs_summaries, max_chars=max_chars)
+
         else:
             ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
             ida_kernwin.warning(f"{PLUGIN_NAME}: Unknown mode '{mode}'.")
             return
 
         if num_written > 0:
-            type_str = "functions" if mode == 'code' else ("nodes" if mode == 'graph' else "bytes")
+            type_str = "functions" if mode in ('code', 'asm') else ("nodes" if mode == 'graph' else "bytes")
             final_message = f"{PLUGIN_NAME}: Successfully wrote {num_written} {type_str} to:\n{output_file_path}"
             ida_kernwin.execute_sync(lambda: (ida_kernwin.info(final_message), 1)[1], ida_kernwin.MFF_WRITE)
 
@@ -881,7 +1156,7 @@ class DumpDotCtxActionHandler(ida_kernwin.action_handler_t):
             container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
             ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
             if ca_depth is None: return 0
-            container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
+            container[0]["callee_depth"] = int(ca_depth) if c_depth >= 0 else 0
             xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
                                                          "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
             if xref_types_str is None: return 0
@@ -947,7 +1222,7 @@ class DumpPTNCtxActionHandler(ida_kernwin.action_handler_t):
             if ca_depth is None: return 0
             container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 1 else 1
             default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_provenance.ptn")
-            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output PTN File")
+            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output PTN File (.ptn or .json)")
             if not output_file: return 0
             container[0]["output_file"] = output_file
             container[0]["caller_depth"] = 0
@@ -1022,6 +1297,73 @@ class CopyPTNVarCtxActionHandler(ida_kernwin.action_handler_t):
             return ida_kernwin.AST_ENABLE_FOR_WIDGET
         return ida_kernwin.AST_DISABLE_FOR_WIDGET
 
+class DumpAsmCtxActionHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        global g_dump_in_progress, g_multi_dump_active
+        widget = ctx.widget
+        widget_type = ida_kernwin.get_widget_type(widget)
+        if widget_type != ida_kernwin.BWN_PSEUDOCODE:
+            return 1
+        vu = ida_hexrays.get_widget_vdui(widget)
+        if not vu or not vu.cfunc:
+            ida_kernwin.warning(f"{PLUGIN_NAME}: Not available for this function.")
+            return 1
+        start_func_ea = vu.cfunc.entry_ea
+        start_func_name = ida_funcs.get_func_name(start_func_ea) or f"sub_{start_func_ea:X}"
+        with g_dump_lock:
+            if start_func_ea in g_dump_in_progress:
+                ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running for {start_func_name}.")
+                return 1
+            if g_multi_dump_active:
+                ida_kernwin.warning(f"{PLUGIN_NAME}: A multi-function operation is currently running.")
+                return 1
+            g_dump_in_progress.add(start_func_ea)
+
+        input_results = {"caller_depth": -1, "callee_depth": -1, "output_file": None, "xref_types": None, "max_chars": 0}
+        input_container = [input_results]
+        def get_inputs_main(container):
+            c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
+            if c_depth is None: return 0
+            container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
+            ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
+            if ca_depth is None: return 0
+            container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
+            xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
+                                                         "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
+            if xref_types_str is None: return 0
+            if xref_types_str.strip().lower() == 'all':
+                container[0]["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+            else:
+                container[0]["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
+            m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
+            if m_chars is None: return 0
+            container[0]["max_chars"] = int(m_chars) if m_chars >= 0 else 0
+            default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_asm_callers{c_depth}_callees{ca_depth}.asm")
+            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output ASM File")
+            if not output_file: return 0
+            container[0]["output_file"] = output_file
+            return 1
+        sync_status = ida_kernwin.execute_sync(lambda: get_inputs_main(input_container), ida_kernwin.MFF_WRITE)
+        final_inputs = input_container[0]
+        caller_depth = final_inputs["caller_depth"]
+        callee_depth = final_inputs["callee_depth"]
+        output_file_path = final_inputs["output_file"]
+        xref_types = final_inputs["xref_types"]
+        max_chars = final_inputs["max_chars"]
+        if sync_status != 1 or caller_depth < 0 or callee_depth < 0 or not output_file_path or not xref_types:
+            with g_dump_lock:
+                g_dump_in_progress.discard(start_func_ea)
+            return 1
+        task_thread = threading.Thread(target=dump_task, args=(set([start_func_ea]), caller_depth, callee_depth, output_file_path, 'asm', xref_types, max_chars))
+        task_thread.start()
+        return 1
+    def update(self, ctx):
+        if ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE:
+            vu = ida_hexrays.get_widget_vdui(ctx.widget)
+            if vu and vu.cfunc:
+                return ida_kernwin.AST_ENABLE_FOR_WIDGET
+        return ida_kernwin.AST_DISABLE_FOR_WIDGET
+
 def perform_multi_dump(mode):
     global g_dump_in_progress, g_multi_dump_active
     with g_dump_lock:
@@ -1075,7 +1417,7 @@ def perform_multi_dump(mode):
         container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
         ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
         if ca_depth is None: return 0
-        container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
+        container[0]["callee_depth"] = int(ca_depth) if c_depth >= 0 else 0
         xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
                                                      "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
         if xref_types_str is None:
@@ -1095,6 +1437,9 @@ def perform_multi_dump(mode):
         elif mode == 'ptn':
             default_filename = f"multi_ptn_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.ptn"
             title = "Select Output PTN File"
+        elif mode == 'asm':
+            default_filename = f"multi_asm_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.asm"
+            title = "Select Output ASM File"
         else:
             default_filename = f"multi_graph_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.dot"
             title = "Select Output DOT File"
@@ -1140,6 +1485,13 @@ class DumpPTNMultiActionHandler(ida_kernwin.action_handler_t):
     def update(self, ctx):
         return ida_kernwin.AST_ENABLE_ALWAYS
 
+class DumpAsmMultiActionHandler(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        perform_multi_dump('asm')
+        return 1
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
 class DumpHooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup_handle, ctx=None):
         widget_type = ida_kernwin.get_widget_type(widget)
@@ -1149,12 +1501,13 @@ class DumpHooks(ida_kernwin.UI_Hooks):
                 ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_ID_DOT_CTX, "Dump code/", ida_kernwin.SETMENU_INS)
                 ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_ID_PTN_CTX, "Dump code/", ida_kernwin.SETMENU_INS)
                 ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_ID_PTN_COPY_CTX, "Dump code/", ida_kernwin.SETMENU_INS)
-            except Exception as e:
+                ida_kernwin.attach_action_to_popup(widget, popup_handle, ACTION_ID_ASM_CTX, "Dump code/", ida_kernwin.SETMENU_INS)
+            except Exception:
                 traceback.print_exc()
 
 class CodeDumperPlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_PROC | idaapi.PLUGIN_FIX
-    comment = "Dumps decompiled code, DOT graphs, and PTN provenance"
+    comment = "Dumps decompiled code, DOT graphs, PTN provenance, and assembly"
     help = "Use Edit->Plugins->CodeDumper, or right-click in Pseudocode view"
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
@@ -1178,36 +1531,48 @@ class CodeDumperPlugin(idaapi.plugin_t):
         if not ida_kernwin.register_action(action_desc_ptn_copy_ctx):
             ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_CTX)
             return idaapi.PLUGIN_SKIP
+        action_desc_asm_ctx = ida_kernwin.action_desc_t(ACTION_ID_ASM_CTX, ACTION_LABEL_ASM_CTX, DumpAsmCtxActionHandler(), self.wanted_hotkey, ACTION_TOOLTIP_ASM_CTX, 199)
+        if not ida_kernwin.register_action(action_desc_asm_ctx):
+            ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX)
+            return idaapi.PLUGIN_SKIP
 
         action_desc_code_multi = ida_kernwin.action_desc_t(ACTION_ID_CODE_MULTI, ACTION_LABEL_CODE_MULTI, DumpCodeMultiActionHandler(), None, ACTION_TOOLTIP_CODE_MULTI, 199)
         if not ida_kernwin.register_action(action_desc_code_multi):
             ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX)
-            ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX)
+            ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX); ida_kernwin.unregister_action(ACTION_ID_ASM_CTX)
             return idaapi.PLUGIN_SKIP
 
         action_desc_dot_multi = ida_kernwin.action_desc_t(ACTION_ID_DOT_MULTI, ACTION_LABEL_DOT_MULTI, DumpDotMultiActionHandler(), None, ACTION_TOOLTIP_DOT_MULTI, 199)
         if not ida_kernwin.register_action(action_desc_dot_multi):
             ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX)
             ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX)
-            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI)
+            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI); ida_kernwin.unregister_action(ACTION_ID_ASM_CTX)
             return idaapi.PLUGIN_SKIP
 
         action_desc_ptn_multi = ida_kernwin.action_desc_t(ACTION_ID_PTN_MULTI, ACTION_LABEL_PTN_MULTI, DumpPTNMultiActionHandler(), None, ACTION_TOOLTIP_PTN_MULTI, 199)
         if not ida_kernwin.register_action(action_desc_ptn_multi):
             ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX)
             ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX)
-            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI); ida_kernwin.unregister_action(ACTION_ID_DOT_MULTI)
+            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI); ida_kernwin.unregister_action(ACTION_ID_DOT_MULTI); ida_kernwin.unregister_action(ACTION_ID_ASM_CTX)
+            return idaapi.PLUGIN_SKIP
+
+        action_desc_asm_multi = ida_kernwin.action_desc_t(ACTION_ID_ASM_MULTI, ACTION_LABEL_ASM_MULTI, DumpAsmMultiActionHandler(), None, ACTION_TOOLTIP_ASM_MULTI, 199)
+        if not ida_kernwin.register_action(action_desc_asm_multi):
+            ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX)
+            ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX)
+            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI); ida_kernwin.unregister_action(ACTION_ID_DOT_MULTI); ida_kernwin.unregister_action(ACTION_ID_PTN_MULTI); ida_kernwin.unregister_action(ACTION_ID_ASM_CTX)
             return idaapi.PLUGIN_SKIP
 
         ida_kernwin.attach_action_to_menu(MENU_PATH_MULTI, ACTION_ID_CODE_MULTI, ida_kernwin.SETMENU_APP)
         ida_kernwin.attach_action_to_menu(MENU_PATH_MULTI, ACTION_ID_DOT_MULTI, ida_kernwin.SETMENU_APP)
         ida_kernwin.attach_action_to_menu(MENU_PATH_MULTI, ACTION_ID_PTN_MULTI, ida_kernwin.SETMENU_APP)
+        ida_kernwin.attach_action_to_menu(MENU_PATH_MULTI, ACTION_ID_ASM_MULTI, ida_kernwin.SETMENU_APP)
 
         self.hooks = DumpHooks()
         if not self.hooks.hook():
             ida_kernwin.unregister_action(ACTION_ID_CTX); ida_kernwin.unregister_action(ACTION_ID_DOT_CTX)
             ida_kernwin.unregister_action(ACTION_ID_PTN_CTX); ida_kernwin.unregister_action(ACTION_ID_PTN_COPY_CTX)
-            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI); ida_kernwin.unregister_action(ACTION_ID_DOT_MULTI); ida_kernwin.unregister_action(ACTION_ID_PTN_MULTI)
+            ida_kernwin.unregister_action(ACTION_ID_CODE_MULTI); ida_kernwin.unregister_action(ACTION_ID_DOT_MULTI); ida_kernwin.unregister_action(ACTION_ID_PTN_MULTI); ida_kernwin.unregister_action(ACTION_ID_ASM_MULTI); ida_kernwin.unregister_action(ACTION_ID_ASM_CTX)
             self.hooks = None
             return idaapi.PLUGIN_SKIP
         return idaapi.PLUGIN_KEEP
@@ -1228,7 +1593,9 @@ class CodeDumperPlugin(idaapi.plugin_t):
         except Exception: pass
         try: ida_kernwin.detach_action_from_menu(MENU_PATH_MULTI, ACTION_ID_PTN_MULTI)
         except Exception: pass
-        for act in [ACTION_ID_CTX, ACTION_ID_DOT_CTX, ACTION_ID_PTN_CTX, ACTION_ID_PTN_COPY_CTX, ACTION_ID_CODE_MULTI, ACTION_ID_DOT_MULTI, ACTION_ID_PTN_MULTI]:
+        try: ida_kernwin.detach_action_from_menu(MENU_PATH_MULTI, ACTION_ID_ASM_MULTI)
+        except Exception: pass
+        for act in [ACTION_ID_CTX, ACTION_ID_DOT_CTX, ACTION_ID_PTN_CTX, ACTION_ID_PTN_COPY_CTX, ACTION_ID_CODE_MULTI, ACTION_ID_DOT_MULTI, ACTION_ID_PTN_MULTI, ACTION_ID_ASM_CTX, ACTION_ID_ASM_MULTI]:
             try: ida_kernwin.unregister_action(act)
             except Exception: pass
         with g_dump_lock:
