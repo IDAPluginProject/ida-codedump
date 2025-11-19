@@ -539,15 +539,15 @@ def write_code_file(output_file_path, decompiled_results, start_func_eas, caller
 
         header_lines.append(
             "// --------\n"
-            "#PTN v0\n"
+            "#PTN v1\n"
             "// @PTN LEGEND\n"
-            "// Nodes: L(F,i)=local i in function F; P(F,i)=param i of F; G(addr)=global at addr; F(Fx)=function Fx.\n"
-            "// Slices: @[off:len] in bytes; '?' unknown; '&' = address-of; '*' = deref; optional cast as :(type).\n"
-            "// A: alias inside function   => A: dst := src[@slice][mode][:cast] {meta}\n"
-            "// I: inbound (caller→this)   => I: origin -> P(F,i) {caller=F?,cs=0x...,conf=...}\n"
-            "// E: outbound (this→callee)  => E: origin -> A(F?,arg) [-> A(F?,arg)...] {cs=0x...,conf=...}\n"
-            "// G: global touch/summary    => G: F(F?) -> G(0xADDR)   or   G: F(writer) -> G(0xADDR) -> F(reader)\n"
-            "// Dictionary entry (per function block): // @PTN D:F?=0xEA,Name\n"
+            "// Nodes: L(name)=local; P(name)=param; G(name|addr)=global; C(val)=constant; R(func)=return val.\n"
+            "// Slices: @[off:len] or .field_name; '&' = address-of; '*' = deref.\n"
+            "// A: alias/assignment => A: dst := src\n"
+            "// I: inbound (caller->param) => I: origin -> P(name)\n"
+            "// E: outbound (arg->callee)  => E: origin -> A(callee, arg_idx)\n"
+            "// R: return flow => R: callee() -> L(var)\n"
+            "// G: global access => G: F(func) -> G(addr) (write) or G(addr) -> F(func) (read)\n"
             "// --------\n"
         )
 
@@ -721,15 +721,15 @@ def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int,
 
         header_lines.append(
             "// --------\n"
-            "#PTN v0\n"
+            "#PTN v1\n"
             "// @PTN LEGEND\n"
-            "// Nodes: L(F,i)=local i in function F; P(F,i)=param i of F; G(addr)=global at addr; F(Fx)=function Fx.\n"
-            "// Slices: @[off:len] in bytes; '?' unknown; '&' = address-of; '*' = deref; optional cast as :(type).\n"
-            "// A: alias inside function   => A: dst := src[@slice][mode][:cast] {meta}\n"
-            "// I: inbound (caller→this)   => I: origin -> P(F,i) {caller=F?,cs=0x...,conf=...}\n"
-            "// E: outbound (this→callee)  => E: origin -> A(F?,arg) [-> A(F?,arg)...] {cs=0x...,conf=...}\n"
-            "// G: global touch/summary    => G: F(F?) -> G(0xADDR)   or   G: F(writer) -> G(0xADDR) -> F(reader)\n"
-            "// Dictionary entry (per function block): // @PTN D:F?=0xEA,Name\n"
+            "// Nodes: L(name)=local; P(name)=param; G(name|addr)=global; C(val)=constant; R(func)=return val.\n"
+            "// Slices: @[off:len] or .field_name; '&' = address-of; '*' = deref.\n"
+            "// A: alias/assignment => A: dst := src\n"
+            "// I: inbound (caller->param) => I: origin -> P(name)\n"
+            "// E: outbound (arg->callee)  => E: origin -> A(callee, arg_idx)\n"
+            "// R: return flow => R: callee() -> L(var)\n"
+            "// G: global access => G: F(func) -> G(addr) (write) or G(addr) -> F(func) (read)\n"
             "// --------\n"
         )
 
@@ -1255,15 +1255,20 @@ class CopyPTNVarCtxActionHandler(ida_kernwin.action_handler_t):
             ida_kernwin.warning(f"{PLUGIN_NAME}: Not available for this function.")
             return 1
         func_ea = vu.cfunc.entry_ea
-        def run_collect_current_fs():
+
+        fs_container = [None]
+        def run_collect_current_fs(container):
             try:
-                return analyze_functions_ctree([func_ea]).get(func_ea)
+                container[0] = analyze_functions_ctree([func_ea]).get(func_ea)
+                return 1
             except Exception:
                 traceback.print_exc()
-                return None
-        fs = None
-        ida_kernwin.execute_sync(lambda: None, ida_kernwin.MFF_READ)
-        fs = run_collect_current_fs()
+                container[0] = None
+                return 0
+
+        ida_kernwin.execute_sync(lambda: run_collect_current_fs(fs_container), ida_kernwin.MFF_READ)
+        fs = fs_container[0]
+
         if not fs:
             ida_kernwin.warning(f"{PLUGIN_NAME}: Could not compute provenance for current function.")
             return 1

@@ -12,21 +12,23 @@ class ArgUse:
     cs_ea: int
     callee_ea: Optional[int]
     arg_index: int
-    base_kind: str                 # 'L' | 'P' | 'G' | 'U' (unknown)
-    base_id: int                   # lvar_idx | param_idx | global_ea | -1
+    base_kind: str                 # 'L' | 'P' | 'G' | 'C' | 'U'
+    base_id: int                   # lvar_idx | param_idx | global_ea | const_val | -1
     base_name: str = ""
     off: Optional[int] = None      # bytes
     length: Optional[int] = None   # bytes
     mode: str = ""                 # '', '&', '*'
     cast: Optional[str] = None
     conf: ConfT = "med"
+    member_name: Optional[str] = None
+    callee_name: Optional[str] = None # Pre-resolved callee name
 
 @dataclass
 class Alias:
     dst_kind: str                  # 'L' or 'P'
     dst_id: int
     dst_name: str
-    src_kind: str                  # 'L' | 'P' | 'G' | 'U'
+    src_kind: str                  # 'L' | 'P' | 'G' | 'C' | 'R' | 'U'
     src_id: int
     src_name: str = ""
     off: Optional[int] = None
@@ -34,6 +36,7 @@ class Alias:
     mode: str = "&"
     cast: Optional[str] = None
     conf: ConfT = "med"
+    member_name: Optional[str] = None
 
 @dataclass
 class GlobalAccess:
@@ -41,7 +44,8 @@ class GlobalAccess:
     off: Optional[int]             # byte offset into global, if known
     length: Optional[int]          # byte length, if known
     kind: str                      # 'R' or 'W'
-    cs_ea: int = 0                 # code-site EA for this access (per-instruction correlation)
+    cs_ea: int = 0                 # code-site EA for this access
+    name: str = ""                 # Resolved global name
 
 @dataclass
 class FunctionSummary:
@@ -71,7 +75,9 @@ class PTNEmitter:
         return self._fid_by_ea.get(ea, f"F?")
 
     @staticmethod
-    def _fmt_slice(off: Optional[int], length: Optional[int]) -> str:
+    def _fmt_slice(off: Optional[int], length: Optional[int], member: Optional[str]) -> str:
+        if member:
+            return f".{member}"
         if off is None and length is None:
             return ""
         if off is None and length is not None:
@@ -96,8 +102,9 @@ class PTNEmitter:
         return " {" + ",".join(parts) + "}"
 
     def _fmt_node_L(self, fid: str, lidx: int, off: Optional[int], length: Optional[int],
-                    mode: str, cast: Optional[str], name: str = "", meta: Optional[Dict[str, object]] = None) -> str:
-        s = f"L({fid},{lidx}){self._fmt_slice(off, length)}{mode}"
+                    mode: str, cast: Optional[str], name: str = "", member: Optional[str] = None, meta: Optional[Dict[str, object]] = None) -> str:
+        ident = name if name else f"{fid},{lidx}"
+        s = f"L({ident}){self._fmt_slice(off, length, member)}{mode}"
         if cast:
             s += f":({cast})"
         if meta:
@@ -105,8 +112,9 @@ class PTNEmitter:
         return s
 
     def _fmt_node_P(self, fid: str, pidx: int, off: Optional[int], length: Optional[int],
-                    mode: str, cast: Optional[str], meta: Optional[Dict[str, object]] = None) -> str:
-        s = f"P({fid},{pidx}){self._fmt_slice(off, length)}{mode}"
+                    mode: str, cast: Optional[str], name: str = "", member: Optional[str] = None, meta: Optional[Dict[str, object]] = None) -> str:
+        ident = name if name else f"{fid},{pidx}"
+        s = f"P({ident}){self._fmt_slice(off, length, member)}{mode}"
         if cast:
             s += f":({cast})"
         if meta:
@@ -119,14 +127,29 @@ class PTNEmitter:
             s += self._fmt_meta(meta)
         return s
 
-    def _fmt_node_G(self, ea: int, off: Optional[int], length: Optional[int], meta: Optional[Dict[str, object]] = None) -> str:
-        s = f"G(0x{ea:X}){self._fmt_slice(off, length)}"
+    def _fmt_node_G(self, ea: int, off: Optional[int], length: Optional[int], name: str = "", member: Optional[str] = None, meta: Optional[Dict[str, object]] = None) -> str:
+        ident = name if name else f"0x{ea:X}"
+        s = f"G({ident}){self._fmt_slice(off, length, member)}"
         if meta:
             s += self._fmt_meta(meta)
         return s
 
-    def _fmt_node_F(self, fid: str, meta: Optional[Dict[str, object]] = None) -> str:
-        s = f"F({fid})"
+    def _fmt_node_C(self, val: int, meta: Optional[Dict[str, object]] = None) -> str:
+        s = f"C(0x{val:X})"
+        if meta:
+            s += self._fmt_meta(meta)
+        return s
+
+    def _fmt_node_R(self, fid: str, name: str = "", meta: Optional[Dict[str, object]] = None) -> str:
+        ident = name if name else fid
+        s = f"R({ident})"
+        if meta:
+            s += self._fmt_meta(meta)
+        return s
+
+    def _fmt_node_F(self, fid: str, name: str = "", meta: Optional[Dict[str, object]] = None) -> str:
+        ident = name if name else fid
+        s = f"F({ident})"
         if meta:
             s += self._fmt_meta(meta)
         return s
@@ -161,11 +184,12 @@ class PTNEmitter:
                         meta["cs"] = au.cs_ea
                     if au.conf:
                         meta["conf"] = au.conf
+                    if au.member_name:
+                        meta["member"] = au.member_name
                     lst.append((au.callee_ea, au.arg_index, meta))
         return fwd
 
     def _build_incoming_map(self) -> Dict[Tuple[int, int], List[Dict[str, object]]]:
-        # Key: (callee_ea, param_index)
         inc: Dict[Tuple[int, int], List[Dict[str, object]]] = {}
         for caller_ea, fs in self.summaries.items():
             for au in fs.arguses:
@@ -184,13 +208,14 @@ class PTNEmitter:
                     "cast": au.cast,
                     "conf": au.conf,
                     "cs_ea": au.cs_ea,
+                    "member": au.member_name
                 })
         return inc
 
     def emit_ptn(self, start_eas: Set[int], callee_depth: int, restrict_eas: Optional[Set[int]] = None) -> str:
         lines: List[str] = []
         target_set = restrict_eas or start_eas or set(self.summaries.keys())
-        lines.append("#PTN v0")
+        lines.append("#PTN v1")
         lines.append(self._dict_header(target_set))
 
         param_forward = self._build_param_forward()
@@ -202,32 +227,32 @@ class PTNEmitter:
                 visited_line_keys.add(s)
                 lines.append(s)
 
-        # Aliases (per function)
         for fea in sorted(target_set):
             fs = self.summaries.get(fea)
             if not fs:
                 continue
             fid = self._fid(fea)
-            add_line(f"D:{fid}=0x{fea:X},{fs.func_name}")  # per-function PTN header for locality
+            add_line(f"D:{fid}=0x{fea:X},{fs.func_name}")
             for al in fs.aliases:
-                dst = f"{al.dst_kind}({fid},{al.dst_id})"
-                src = self._fmt_origin(al.src_kind, fea, al.src_id, al.src_name, al.off, al.length, al.mode, al.cast, {"conf": al.conf})
+                dst = f"{al.dst_kind}({al.dst_name})"
+                src = self._fmt_origin(al.src_kind, fea, al.src_id, al.src_name, al.off, al.length, al.mode, al.cast, al.member_name, {"conf": al.conf})
                 add_line(f"A:{dst}:={src}")
 
-        # Inbound (upstream) edges: caller origins into this function's parameters
         for (callee_ea, pidx), entries in incoming_map.items():
             if callee_ea not in target_set:
                 continue
             callee_fid = self._fid(callee_ea)
+            callee_fs = self.summaries.get(callee_ea)
+            pname = callee_fs.params.get(pidx, "") if callee_fs else ""
+
             for ent in entries:
                 caller_ea = ent["caller_ea"]
                 origin = self._fmt_origin(ent["origin_kind"], caller_ea, ent["origin_id"], ent["origin_name"],
-                                          ent["off"], ent["length"], ent["mode"], ent["cast"],
+                                          ent["off"], ent["length"], ent["mode"], ent["cast"], ent["member"],
                                           {"conf": ent["conf"], "cs": ent["cs_ea"], "caller": self._fid(caller_ea)})
-                dst = self._fmt_node_P(callee_fid, pidx, None, None, "", None, None)
+                dst = self._fmt_node_P(callee_fid, pidx, None, None, "", None, pname, None, None)
                 add_line(f"I:{origin} -> {dst}")
 
-        # Outbound (downstream) param/local to callee argument flow incl. chaining
         by_func: Dict[int, List[ArgUse]] = {}
         for fea, fs in self.summaries.items():
             by_func.setdefault(fea, []).extend(fs.arguses)
@@ -237,10 +262,11 @@ class PTNEmitter:
             for au in uses:
                 if au.callee_ea is None:
                     continue
-                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast,
+                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast, au.member_name,
                                           {"conf": au.conf, "cs": au.cs_ea} if au.cs_ea else {"conf": au.conf})
                 fid_to = self._fid(au.callee_ea)
-                add_line(f"E:{origin} -> {self._fmt_node_A(fid_to, au.arg_index)}")
+                callee_name = au.callee_name or self._name_by_ea.get(au.callee_ea, "")
+                add_line(f"E:{origin} -> {self._fmt_node_A(callee_name or fid_to, au.arg_index)}")
 
                 frontier: List[Tuple[int, int, int]] = []
                 if au.base_kind in ("L", "P"):
@@ -260,7 +286,6 @@ class PTNEmitter:
                         add_line(f"E:{origin} -> A({fid_mid},{pidx}) -> A({fid_next},{next_argk})")
                         frontier.append((next_callee_ea, next_argk, depth + 1))
 
-        # Global writer→reader across subgraph
         writers: Dict[int, Set[int]] = {}
         readers: Dict[int, Set[int]] = {}
         for fea, fs in self.summaries.items():
@@ -271,28 +296,39 @@ class PTNEmitter:
                     readers.setdefault(ga.ea, set()).add(fea)
         for gea, ws in writers.items():
             rs = readers.get(gea, set())
+            # Find a name for the global from any summary that has it
+            gname = ""
+            for fs in self.summaries.values():
+                for ga in fs.globals:
+                    if ga.ea == gea and ga.name:
+                        gname = ga.name
+                        break
+                if gname: break
+
             for fw in sorted(ws):
                 for fr in sorted(rs):
                     if fw in target_set or fr in target_set:
-                        lines.append("G:" + self._fmt_node_F(self._fid(fw)) + " -> " +
-                                     self._fmt_node_G(gea, None, None, {}) + " -> " +
-                                     self._fmt_node_F(self._fid(fr)))
+                        add_line("G:" + self._fmt_node_F(self._fid(fw), self._name_by_ea.get(fw,"")) + " -> " +
+                                     self._fmt_node_G(gea, None, None, gname, None, {}) + " -> " +
+                                     self._fmt_node_F(self._fid(fr), self._name_by_ea.get(fr,"")))
 
         return "\n".join(lines) + "\n"
 
     def _fmt_origin(self, kind: str, fea: int, idx: int, name: str,
-                    off: Optional[int], length: Optional[int], mode: str, cast: Optional[str],
+                    off: Optional[int], length: Optional[int], mode: str, cast: Optional[str], member: Optional[str],
                     meta: Dict[str, object]) -> str:
         fid = self._fid(fea)
         m = dict(meta)
-        if name:
-            m["name"] = name
         if kind == "L":
-            return self._fmt_node_L(fid, max(idx, -1), off, length, mode, cast, name, m)
+            return self._fmt_node_L(fid, max(idx, -1), off, length, mode, cast, name, member, m)
         if kind == "P":
-            return self._fmt_node_P(fid, max(idx, -1), off, length, mode, cast, m)
+            return self._fmt_node_P(fid, max(idx, -1), off, length, mode, cast, name, member, m)
         if kind == "G":
-            return self._fmt_node_G(idx, off, length, m)
+            return self._fmt_node_G(idx, off, length, name, member, m)
+        if kind == "C":
+            return self._fmt_node_C(idx, m)
+        if kind == "R":
+            return self._fmt_node_R(fid, name, m)
         return "U" + self._fmt_meta(m)
 
     def per_function_annotations(self, callee_depth: int) -> Dict[int, str]:
@@ -304,65 +340,58 @@ class PTNEmitter:
             lines: List[str] = []
             lines.append(f"// @PTN D:{fid}=0x{fea:X},{fs.func_name}")
 
-            # Aliases within this function
             for al in fs.aliases:
-                dst = f"{al.dst_kind}({fid},{al.dst_id})"
-                src = self._fmt_origin(al.src_kind, fea, al.src_id, al.src_name, al.off, al.length, al.mode, al.cast, {"conf": al.conf})
+                dst = f"{al.dst_kind}({al.dst_name})"
+                src = self._fmt_origin(al.src_kind, fea, al.src_id, al.src_name, al.off, al.length, al.mode, al.cast, al.member_name, {"conf": al.conf})
                 lines.append(f"// @PTN A:{dst}:={src}")
 
-            # Inbound (upstream) provenance: what callers feed into P(fid, pidx)
             for (callee_ea, pidx), entries in incoming_map.items():
                 if callee_ea != fea:
                     continue
+                pname = fs.params.get(pidx, "")
                 for ent in entries:
                     caller_ea = ent["caller_ea"]
                     origin = self._fmt_origin(ent["origin_kind"], caller_ea, ent["origin_id"], ent["origin_name"],
-                                              ent["off"], ent["length"], ent["mode"], ent["cast"],
+                                              ent["off"], ent["length"], ent["mode"], ent["cast"], ent["member"],
                                               {"conf": ent["conf"], "cs": ent["cs_ea"], "caller": self._fid(caller_ea)})
-                    dst = self._fmt_node_P(fid, pidx, None, None, "", None, None)
+                    dst = self._fmt_node_P(fid, pidx, None, None, "", None, pname, None, None)
                     lines.append(f"// @PTN I:{origin} -> {dst}")
 
-            # Direct outbound edges
             for au in fs.arguses:
                 if au.callee_ea is None:
                     continue
-                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast,
+                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast, au.member_name,
                                           {"conf": au.conf, "cs": au.cs_ea} if au.cs_ea else {"conf": au.conf})
-                lines.append(f"// @PTN E:{origin} -> {self._fmt_node_A(self._fid(au.callee_ea), au.arg_index)}")
+                callee_name = au.callee_name or self._name_by_ea.get(au.callee_ea, "")
+                lines.append(f"// @PTN E:{origin} -> {self._fmt_node_A(callee_name or self._fid(au.callee_ea), au.arg_index)}")
                 if callee_depth > 1 and au.base_kind in ("L", "P"):
                     key = (au.callee_ea, au.arg_index)
                     for (nc_ea, narg, meta) in param_forward.get(key, []):
                         lines.append(f"// @PTN E:{origin} -> A({self._fid(au.callee_ea)},{au.arg_index}) -> A({self._fid(nc_ea)},{narg})")
 
-            # Globals touched by this function
             for ga in fs.globals:
+                gname = ga.name
                 if ga.kind == "W":
-                    lines.append(f"// @PTN G:{self._fmt_node_F(fid)} -> {self._fmt_node_G(ga.ea, ga.off, ga.length)}")
+                    lines.append(f"// @PTN G:{self._fmt_node_F(fid, fs.func_name)} -> {self._fmt_node_G(ga.ea, ga.off, ga.length, gname)}")
                 elif ga.kind == "R":
-                    lines.append(f"// @PTN G:{self._fmt_node_G(ga.ea, ga.off, ga.length)} -> {self._fmt_node_F(fid)}")
+                    lines.append(f"// @PTN G:{self._fmt_node_G(ga.ea, ga.off, ga.length, gname)} -> {self._fmt_node_F(fid, fs.func_name)}")
 
             out[fea] = "\n".join(lines) + ("\n" if lines else "")
         return out
 
     def per_instruction_hints(self, callee_depth: int = 1) -> Dict[int, Dict[int, List[str]]]:
-        """
-        Returns mapping: func_ea -> (ea -> [hint line (without comment prefix)]).
-        Hints include:
-          - E: origin -> A(Fcallee,arg)  (+ optional chaining if callee_depth > 1)
-          - G: F(Fid) -> G(0xEA) and G(0xEA) -> F(Fid) at the access site
-        """
         hints: Dict[int, Dict[int, List[str]]] = {}
         param_forward = self._build_param_forward()
 
-        # Callsites
         for fea, fs in self.summaries.items():
             for au in fs.arguses:
                 if not au.cs_ea or au.callee_ea is None:
                     continue
-                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast,
+                origin = self._fmt_origin(au.base_kind, fea, au.base_id, au.base_name, au.off, au.length, au.mode, au.cast, au.member_name,
                                           {"conf": au.conf})
                 fid_to = self._fid(au.callee_ea)
-                line0 = f"@PTN E:{origin} -> {self._fmt_node_A(fid_to, au.arg_index)}"
+                callee_name = au.callee_name or self._name_by_ea.get(au.callee_ea, "")
+                line0 = f"@PTN E:{origin} -> {self._fmt_node_A(callee_name or fid_to, au.arg_index)}"
                 hints.setdefault(fea, {}).setdefault(au.cs_ea, []).append(line0)
 
                 if callee_depth > 1 and au.base_kind in ("L", "P"):
@@ -384,30 +413,27 @@ class PTNEmitter:
                             )
                             frontier.append((next_callee_ea, next_argk, depth + 1))
 
-        # Globals at instruction sites
         for fea, fs in self.summaries.items():
             fid = self._fid(fea)
             for ga in fs.globals:
                 if not ga.cs_ea:
                     continue
+                gname = ga.name
                 if ga.kind == "W":
-                    line = f"@PTN G:{self._fmt_node_F(fid)} -> {self._fmt_node_G(ga.ea, ga.off, ga.length)}"
+                    line = f"@PTN G:{self._fmt_node_F(fid, fs.func_name)} -> {self._fmt_node_G(ga.ea, ga.off, ga.length, gname)}"
                 else:
-                    line = f"@PTN G:{self._fmt_node_G(ga.ea, ga.off, ga.length)} -> {self._fmt_node_F(fid)}"
+                    line = f"@PTN G:{self._fmt_node_G(ga.ea, ga.off, ga.length, gname)} -> {self._fmt_node_F(fid, fs.func_name)}"
                 hints.setdefault(fea, {}).setdefault(ga.cs_ea, []).append(line)
 
         return hints
 
     def emit_ptn_json(self, start_eas: Set[int], callee_depth: int, restrict_eas: Optional[Set[int]] = None) -> str:
-        """
-        JSON representation designed for programmatic/LLM consumption.
-        """
         target_set = sorted(list(restrict_eas or start_eas or set(self.summaries.keys())))
         param_forward = self._build_param_forward()
         incoming_map = self._build_incoming_map()
 
         obj: Dict[str, object] = {
-            "version": "0",
+            "version": "1",
             "dict": [{"fid": self._fid(ea), "ea": f"0x{ea:X}", "name": self._name_by_ea.get(ea, "")} for ea in target_set],
             "aliases": [],
             "calls": [],
@@ -415,7 +441,6 @@ class PTNEmitter:
             "inbound": []
         }
 
-        # Aliases
         for fea in target_set:
             fs = self.summaries.get(fea)
             if not fs:
@@ -423,14 +448,13 @@ class PTNEmitter:
             fid = self._fid(fea)
             for al in fs.aliases:
                 obj["aliases"].append({
-                    "func": {"fid": fid, "ea": f"0x{fea:X}"},
+                    "func": {"fid": fid, "ea": f"0x{fea:X}", "name": fs.func_name},
                     "dst": {"kind": al.dst_kind, "id": al.dst_id, "name": al.dst_name},
                     "src": {"kind": al.src_kind, "id": al.src_id, "name": al.src_name,
-                            "off": al.off, "len": al.length, "mode": al.mode, "cast": al.cast},
+                            "off": al.off, "len": al.length, "mode": al.mode, "cast": al.cast, "member": al.member_name},
                     "conf": al.conf
                 })
 
-        # Calls
         for fea in target_set:
             fs = self.summaries.get(fea)
             if not fs:
@@ -439,38 +463,39 @@ class PTNEmitter:
                 if au.callee_ea is None:
                     continue
                 obj["calls"].append({
-                    "caller": {"fid": self._fid(fea), "ea": f"0x{fea:X}"},
+                    "caller": {"fid": self._fid(fea), "ea": f"0x{fea:X}", "name": fs.func_name},
                     "cs_ea": f"0x{au.cs_ea:X}" if au.cs_ea else None,
                     "origin": {"kind": au.base_kind, "id": au.base_id, "name": au.base_name,
-                               "off": au.off, "len": au.length, "mode": au.mode, "cast": au.cast, "conf": au.conf},
-                    "callee": {"fid": self._fid(au.callee_ea), "ea": f"0x{au.callee_ea:X}"},
+                               "off": au.off, "len": au.length, "mode": au.mode, "cast": au.cast, "member": au.member_name, "conf": au.conf},
+                    "callee": {"fid": self._fid(au.callee_ea), "ea": f"0x{au.callee_ea:X}", "name": au.callee_name or self._name_by_ea.get(au.callee_ea, "")},
                     "arg_index": au.arg_index
                 })
 
-        # Globals
         for fea in target_set:
             fs = self.summaries.get(fea)
             if not fs:
                 continue
             for ga in fs.globals:
                 obj["globals"].append({
-                    "func": {"fid": self._fid(fea), "ea": f"0x{fea:X}"},
+                    "func": {"fid": self._fid(fea), "ea": f"0x{fea:X}", "name": fs.func_name},
                     "op": ga.kind,
                     "global_ea": f"0x{ga.ea:X}",
+                    "global_name": ga.name,
                     "off": ga.off, "len": ga.length,
                     "cs_ea": f"0x{ga.cs_ea:X}" if ga.cs_ea else None
                 })
 
-        # Inbound
         for (callee_ea, pidx), entries in incoming_map.items():
             if callee_ea not in target_set:
                 continue
+            callee_fs = self.summaries.get(callee_ea)
+            pname = callee_fs.params.get(pidx, "") if callee_fs else ""
             for ent in entries:
                 obj["inbound"].append({
-                    "to": {"fid": self._fid(callee_ea), "ea": f"0x{callee_ea:X}", "param": pidx},
-                    "from": {"fid": self._fid(ent["caller_ea"]), "ea": f"0x{ent['caller_ea']:X}"},
+                    "to": {"fid": self._fid(callee_ea), "ea": f"0x{callee_ea:X}", "name": self._name_by_ea.get(callee_ea, ""), "param": pidx, "param_name": pname},
+                    "from": {"fid": self._fid(ent["caller_ea"]), "ea": f"0x{ent['caller_ea']:X}", "name": self._name_by_ea.get(ent['caller_ea'], "")},
                     "origin": {"kind": ent["origin_kind"], "id": ent["origin_id"], "name": ent["origin_name"],
-                               "off": ent["off"], "len": ent["length"], "mode": ent["mode"], "cast": ent["cast"], "conf": ent["conf"]},
+                               "off": ent["off"], "len": ent["length"], "mode": ent["mode"], "cast": ent["cast"], "member": ent["member"], "conf": ent["conf"]},
                     "cs_ea": f"0x{ent['cs_ea']:X}" if ent["cs_ea"] else None
                 })
 

@@ -9,8 +9,9 @@ import ida_nalt
 import idautils
 import idc
 import ida_name
+import ida_typeinf
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from ptn_utils import FunctionSummary, ArgUse, GlobalAccess, Alias
 
 # Intraprocedural provenance extraction based primarily on ctree with defensive fallbacks.
@@ -56,17 +57,31 @@ def _unwrap_casts(e):
         e = e.x
     return e
 
-def _normalize_expr_origin(cfunc, e) -> Tuple[str, int, str, Optional[int], Optional[int], Optional[str], str]:
+def _resolve_struct_member(t, offset: int) -> Optional[str]:
     """
-    Returns (base_kind, base_id, base_name, off, length, cast, mode)
-    base_kind: 'L' | 'P' | 'G' | 'U'
-    base_id: lidx | pidx | global_ea | -1
-    base_name: textual name for humans/LLMs when index is -1
-    off: byte offset if known
-    length: byte length if known
-    cast: textual cast type if present
-    mode: '', '&', or '*'
+    Given a type 't' and a byte offset, try to find the struct member name.
     """
+    try:
+        if not t:
+            return None
+        if t.is_ptr():
+            t = t.get_pointed_object()
+
+        if not t.is_udt():
+            return None
+
+        udt = ida_typeinf.udt_type_data_t()
+        if t.get_udt_details(udt):
+            for m in udt:
+                m_off_bytes = m.offset // 8
+                m_size_bytes = m.size // 8
+                if m_off_bytes <= offset < m_off_bytes + m_size_bytes:
+                    return m.name
+    except Exception:
+        pass
+    return None
+
+def _normalize_expr_origin(cfunc, e) -> Tuple[str, int, str, Optional[int], Optional[int], Optional[str], str, Optional[str]]:
     mode = ""
     off = 0
     length = None
@@ -74,9 +89,11 @@ def _normalize_expr_origin(cfunc, e) -> Tuple[str, int, str, Optional[int], Opti
     base_kind = "U"
     base_id = -1
     base_name = ""
+    member_name = None
+    base_type = None
 
     def peel(expr):
-        nonlocal mode, off, cast_txt
+        nonlocal mode, off, cast_txt, base_type
         cur = expr
         while True:
             if cur is None:
@@ -127,9 +144,11 @@ def _normalize_expr_origin(cfunc, e) -> Tuple[str, int, str, Optional[int], Opti
 
     base = peel(_unwrap_casts(e))
     if base is None:
-        return ("U", -1, "", None, None, cast_txt, mode)
+        return ("U", -1, "", None, None, cast_txt, mode, None)
 
     try:
+        base_type = base.type
+
         if base.op == ida_hexrays.cot_var:
             lv = base.v
             pidx = -1
@@ -151,18 +170,30 @@ def _normalize_expr_origin(cfunc, e) -> Tuple[str, int, str, Optional[int], Opti
                 length = _ptr_pointee_size_bytes(e.type) or _ptr_pointee_size_bytes(base.type)
             else:
                 length = _type_size_bytes(e.type)
+
         elif base.op == ida_hexrays.cot_obj:
             base_kind = "G"
             base_id = int(base.obj_ea)
-            base_name = ""
+            base_name = ida_name.get_name(base_id) or ""
             length = _type_size_bytes(e.type)
+
+        elif base.op == ida_hexrays.cot_num:
+            base_kind = "C"
+            base_id = int(base.numval())
+            base_name = f"0x{base_id:X}"
+            length = _type_size_bytes(e.type)
+
         else:
             base_kind = "U"
             base_id = -1
+
+        if off > 0 and base_type:
+            member_name = _resolve_struct_member(base_type, off)
+
         off_val = off if off != 0 else None
-        return (base_kind, base_id, base_name, off_val, length, cast_txt, mode)
+        return (base_kind, base_id, base_name, off_val, length, cast_txt, mode, member_name)
     except Exception:
-        return ("U", -1, "", None, None, cast_txt, mode)
+        return ("U", -1, "", None, None, cast_txt, mode, None)
 
 class _ProvCollector(ida_hexrays.ctree_visitor_t):
     def __init__(self, cfunc):
@@ -170,6 +201,9 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
         self.cfunc = cfunc
         self.fs = FunctionSummary(func_ea=cfunc.entry_ea,
                                   func_name=_get_func_name(cfunc.entry_ea))
+        self._seen_globals: Set[Tuple[int, str]] = set()
+
+        # Populate params/locals
         try:
             lvars = list(cfunc.get_lvars())
             for lv in lvars:
@@ -183,17 +217,33 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
         except Exception:
             pass
 
+        # Fallback for params if empty (e.g. thunks)
+        if not self.fs.params:
+            try:
+                tif = ida_typeinf.tinfo_t()
+                if ida_nalt.get_tinfo(tif, cfunc.entry_ea):
+                    func_data = ida_typeinf.func_type_data_t()
+                    if tif.get_func_details(func_data):
+                        for i, arg in enumerate(func_data):
+                            if arg.name:
+                                self.fs.params[i] = arg.name
+            except Exception:
+                pass
+
     def _record_arguse(self, call_ea: int, callee_ea: Optional[int], arg_index: int, e):
-        bk, bid, bname, off, length, cast, mode = _normalize_expr_origin(self.cfunc, e)
-        conf = "high" if bk in ("L", "P", "G") else "low"
+        bk, bid, bname, off, length, cast, mode, member = _normalize_expr_origin(self.cfunc, e)
+        conf = "high" if bk in ("L", "P", "G", "C") else "low"
+        callee_name = _get_func_name(callee_ea) if callee_ea else None
         self.fs.arguses.append(ArgUse(
             cs_ea=call_ea or 0,
             callee_ea=callee_ea,
+            callee_name=callee_name,
             arg_index=arg_index,
             base_kind=bk,
             base_id=bid if isinstance(bid, int) else -1,
             base_name=bname or "",
-            off=off, length=length, mode=mode, cast=cast, conf=conf
+            off=off, length=length, mode=mode, cast=cast, conf=conf,
+            member_name=member
         ))
 
     def _record_alias(self, lhs, rhs):
@@ -210,13 +260,33 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                     dst_id = getattr(lv, "idx", -1)
         except Exception:
             return
-        bk, bid, bname, off, length, cast, mode = _normalize_expr_origin(self.cfunc, rhs)
-        if bk in ("L", "P", "G") and mode in ("&", "*", ""):
+
+        if rhs.op == ida_hexrays.cot_call:
+            callee_ea = self._extract_callee_ea(rhs.x)
+            if callee_ea:
+                self.fs.aliases.append(Alias(
+                    dst_kind=dst_kind, dst_id=dst_id, dst_name=dst_name,
+                    src_kind="R", src_id=callee_ea, src_name=_get_func_name(callee_ea),
+                    conf="high"
+                ))
+            return
+
+        bk, bid, bname, off, length, cast, mode, member = _normalize_expr_origin(self.cfunc, rhs)
+        if bk in ("L", "P", "G", "C") and mode in ("&", "*", ""):
             self.fs.aliases.append(Alias(
                 dst_kind=dst_kind, dst_id=dst_id if isinstance(dst_id, int) else -1, dst_name=dst_name or "",
                 src_kind=bk, src_id=bid if isinstance(bid, int) else -1, src_name=bname or "",
-                off=off, length=length, mode=mode or "&", cast=cast, conf="med"
+                off=off, length=length, mode=mode or "&", cast=cast, conf="med",
+                member_name=member
             ))
+
+    def _record_global_access(self, ea: int, off: Optional[int], kind: str, cs_ea: int):
+        key = (ea, kind)
+        if key in self._seen_globals:
+            return
+        self._seen_globals.add(key)
+        name = ida_name.get_name(ea) or ""
+        self.fs.globals.append(GlobalAccess(ea=ea, off=off, length=None, kind=kind, cs_ea=cs_ea, name=name))
 
     def _record_global_write_from_lvalue(self, lhs, cs_ea: int):
         cur = lhs
@@ -225,7 +295,7 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
             while cur:
                 if cur.op == ida_hexrays.cot_obj:
                     gea = int(cur.obj_ea)
-                    self.fs.globals.append(GlobalAccess(ea=gea, off=(off if off else None), length=None, kind="W", cs_ea=cs_ea or 0))
+                    self._record_global_access(gea, (off if off else None), "W", cs_ea or 0)
                     return
                 if cur.op == ida_hexrays.cot_memptr:
                     off += int(cur.m)
@@ -242,21 +312,35 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
             return
 
     def _record_global_read_from_expr(self, e, cs_ea: int):
-        cur = e
+        # Simple traversal to find globals
+        # Note: We do NOT recurse into sub-calls here, as visit_expr handles them.
+        # We just want to find globals in the current expression tree.
+        stack = [e]
         seen = set()
-        stack = [cur]
         try:
             while stack:
                 cur = stack.pop()
                 if not cur or id(cur) in seen:
                     continue
                 seen.add(id(cur))
+
                 if cur.op == ida_hexrays.cot_obj:
                     gea = int(cur.obj_ea)
-                    self.fs.globals.append(GlobalAccess(ea=gea, off=None, length=None, kind="R", cs_ea=cs_ea or 0))
-                for ch in (getattr(cur, "x", None), getattr(cur, "y", None), getattr(cur, "z", None)):
-                    if ch is not None:
-                        stack.append(ch)
+                    # Filter out function addresses used in calls (handled by visit_expr logic)
+                    # But here we are in a generic read.
+                    # If it's a function, we only record if it's NOT a direct call target.
+                    # Since we can't easily know context here, we rely on visit_expr pruning.
+                    # However, if we are here, we are likely in an argument or assignment RHS.
+                    # If it's a function address passed as arg, it IS a global read.
+                    self._record_global_access(gea, None, "R", cs_ea or 0)
+
+                # Don't recurse into nested calls/blocks, let visitor handle them?
+                # Actually, visitor handles all nodes.
+                # So we should only check the *current* node.
+                # But _record_global_read_from_expr was designed as a fallback.
+                # Let's change strategy: Only check 'cur'.
+                # The visitor will visit children.
+                pass
         except Exception:
             return
 
@@ -269,18 +353,33 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                 for k in range(argc):
                     arg = e.a[k]
                     self._record_arguse(call_ea, callee_ea, k, arg)
-                # Also treat the call expression as a read (e.g., for global function pointers used inside arguments)
-                self._record_global_read_from_expr(e, call_ea)
-                return 0
+                    # Manually visit args to capture nested expressions/globals
+                    self.apply_to(arg, None)
+
+                # Handle the callee expression (e.x)
+                # If it's a direct call (cot_obj), we DO NOT want a Global Read record for the function address.
+                # If it's an indirect call (e.g. computed), we want to visit it.
+                if e.x.op != ida_hexrays.cot_obj:
+                    self.apply_to(e.x, None)
+
+                # Prune children (return 1) so we don't double-visit
+                return 1
+
             if e.op == ida_hexrays.cot_asg:
                 a_ea = int(e.ea) if e.ea else 0
                 self._record_global_write_from_lvalue(e.x, a_ea)
                 self._record_alias(e.x, e.y)
-                self._record_global_read_from_expr(e.y, a_ea)
+                # Visitor will visit children naturally if we return 0
                 return 0
-            # Fallback read extraction on other expressions
-            eea = int(e.ea) if e.ea else 0
-            self._record_global_read_from_expr(e, eea)
+
+            if e.op == ida_hexrays.cot_obj:
+                # Standalone object reference (not pruned by cot_call logic above)
+                # This catches globals used in math, assignments, arguments, etc.
+                gea = int(e.obj_ea)
+                # If it's a function, it's a function pointer usage (callback, etc)
+                self._record_global_access(gea, None, "R", int(e.ea) if e.ea else 0)
+                return 0
+
         except Exception:
             pass
         return 0
