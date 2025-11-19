@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import ida_name
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -296,7 +297,6 @@ class PTNEmitter:
                     readers.setdefault(ga.ea, set()).add(fea)
         for gea, ws in writers.items():
             rs = readers.get(gea, set())
-            # Find a name for the global from any summary that has it
             gname = ""
             for fs in self.summaries.values():
                 for ga in fs.globals:

@@ -11,7 +11,7 @@ import idc
 import ida_name
 import ida_typeinf
 
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Callable
 from ptn_utils import FunctionSummary, ArgUse, GlobalAccess, Alias
 
 # Intraprocedural provenance extraction based primarily on ctree with defensive fallbacks.
@@ -203,7 +203,6 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                                   func_name=_get_func_name(cfunc.entry_ea))
         self._seen_globals: Set[Tuple[int, str]] = set()
 
-        # Populate params/locals
         try:
             lvars = list(cfunc.get_lvars())
             for lv in lvars:
@@ -217,7 +216,6 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
         except Exception:
             pass
 
-        # Fallback for params if empty (e.g. thunks)
         if not self.fs.params:
             try:
                 tif = ida_typeinf.tinfo_t()
@@ -312,9 +310,6 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
             return
 
     def _record_global_read_from_expr(self, e, cs_ea: int):
-        # Simple traversal to find globals
-        # Note: We do NOT recurse into sub-calls here, as visit_expr handles them.
-        # We just want to find globals in the current expression tree.
         stack = [e]
         seen = set()
         try:
@@ -326,20 +321,8 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
 
                 if cur.op == ida_hexrays.cot_obj:
                     gea = int(cur.obj_ea)
-                    # Filter out function addresses used in calls (handled by visit_expr logic)
-                    # But here we are in a generic read.
-                    # If it's a function, we only record if it's NOT a direct call target.
-                    # Since we can't easily know context here, we rely on visit_expr pruning.
-                    # However, if we are here, we are likely in an argument or assignment RHS.
-                    # If it's a function address passed as arg, it IS a global read.
                     self._record_global_access(gea, None, "R", cs_ea or 0)
 
-                # Don't recurse into nested calls/blocks, let visitor handle them?
-                # Actually, visitor handles all nodes.
-                # So we should only check the *current* node.
-                # But _record_global_read_from_expr was designed as a fallback.
-                # Let's change strategy: Only check 'cur'.
-                # The visitor will visit children.
                 pass
         except Exception:
             return
@@ -353,30 +336,21 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
                 for k in range(argc):
                     arg = e.a[k]
                     self._record_arguse(call_ea, callee_ea, k, arg)
-                    # Manually visit args to capture nested expressions/globals
                     self.apply_to(arg, None)
 
-                # Handle the callee expression (e.x)
-                # If it's a direct call (cot_obj), we DO NOT want a Global Read record for the function address.
-                # If it's an indirect call (e.g. computed), we want to visit it.
                 if e.x.op != ida_hexrays.cot_obj:
                     self.apply_to(e.x, None)
 
-                # Prune children (return 1) so we don't double-visit
                 return 1
 
             if e.op == ida_hexrays.cot_asg:
                 a_ea = int(e.ea) if e.ea else 0
                 self._record_global_write_from_lvalue(e.x, a_ea)
                 self._record_alias(e.x, e.y)
-                # Visitor will visit children naturally if we return 0
                 return 0
 
             if e.op == ida_hexrays.cot_obj:
-                # Standalone object reference (not pruned by cot_call logic above)
-                # This catches globals used in math, assignments, arguments, etc.
                 gea = int(e.obj_ea)
-                # If it's a function, it's a function pointer usage (callback, etc)
                 self._record_global_access(gea, None, "R", int(e.ea) if e.ea else 0)
                 return 0
 
@@ -404,9 +378,13 @@ class _ProvCollector(ida_hexrays.ctree_visitor_t):
         except Exception:
             return None
 
-def analyze_functions_ctree(func_eas) -> Dict[int, FunctionSummary]:
+def analyze_functions_ctree(func_eas, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[int, FunctionSummary]:
     out: Dict[int, FunctionSummary] = {}
-    for ea in func_eas:
+    total = len(func_eas)
+    for i, ea in enumerate(func_eas):
+        if progress_cb and i % 10 == 0:
+            progress_cb(f"Analyzing provenance... {i}/{total}")
+
         cfunc = None
         try:
             cfunc = ida_hexrays.decompile(ea)

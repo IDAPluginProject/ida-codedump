@@ -38,15 +38,12 @@ import ida_ida
 import ida_gdl
 import ida_lines
 
-import threading
 import os
 import sys
-from functools import partial
 import traceback
-import time
 import re
 from collections import defaultdict
-from typing import Dict, Set, List, Tuple
+from typing import Dict, Set, List, Tuple, Optional, Callable
 
 try:
     from PyQt5 import QtCore, QtGui, QtWidgets
@@ -96,13 +93,18 @@ ACTION_TOOLTIP_ASM_MULTI = "Disassemble a list of functions and their combined c
 
 MENU_PATH_MULTI = f"Edit/{PLUGIN_NAME}/"
 
-g_dump_in_progress = set()
-g_multi_dump_active = False
-g_dump_lock = threading.Lock()
+g_is_running = False
 
-def find_callers_recursive(target_ea, current_depth, max_depth, visited_eas, edges=None, allowed_types=None):
+class OperationCancelled(Exception):
+    pass
+
+def find_callers_recursive(target_ea, current_depth, max_depth, visited_eas, edges=None, allowed_types=None, progress_cb: Optional[Callable[[str], None]] = None):
     if allowed_types is None:
         allowed_types = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+
+    if progress_cb and (len(visited_eas) % 20 == 0):
+        progress_cb(f"Tracing callers... {len(visited_eas)} nodes visited")
+
     if current_depth > max_depth:
         return set()
     if target_ea in visited_eas:
@@ -119,7 +121,7 @@ def find_callers_recursive(target_ea, current_depth, max_depth, visited_eas, edg
                     edges[caller_ea][target_ea].add('direct_call')
                 if caller_ea not in visited_eas:
                     callers.add(caller_ea)
-                    callers.update(find_callers_recursive(caller_ea, current_depth + 1, max_depth, visited_eas, edges=edges, allowed_types=allowed_types))
+                    callers.update(find_callers_recursive(caller_ea, current_depth + 1, max_depth, visited_eas, edges=edges, allowed_types=allowed_types, progress_cb=progress_cb))
         ref_ea = ida_xref.get_next_cref_to(target_ea, ref_ea)
     return callers
 
@@ -245,9 +247,13 @@ def detect_dynamic_imports(target_ea, edges):
                     pass
                 next_ea = idc.next_head(next_ea)
 
-def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edges=None, vtables=None, allowed_types=None):
+def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edges=None, vtables=None, allowed_types=None, progress_cb: Optional[Callable[[str], None]] = None):
     if allowed_types is None:
         allowed_types = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+
+    if progress_cb:
+        progress_cb(f"Tracing callees... {len(visited_eas)} nodes visited")
+
     if current_depth > max_depth:
         return set()
     if target_ea in visited_eas:
@@ -284,7 +290,7 @@ def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edg
                     edges[target_ea][itgt].add('indirect_call')
                 if itgt not in visited_eas:
                     callees_and_refs.add(itgt)
-                    recursive_results = find_callees_recursive(itgt, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types)
+                    recursive_results = find_callees_recursive(itgt, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types, progress_cb=progress_cb)
                     callees_and_refs.update(recursive_results)
 
         if 'jump_table' in allowed_types:
@@ -294,7 +300,7 @@ def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edg
                     edges[target_ea][jtt].add('jump_table')
                 if jtt not in visited_eas:
                     callees_and_refs.add(jtt)
-                    recursive_results = find_callees_recursive(jtt, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types)
+                    recursive_results = find_callees_recursive(jtt, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types, progress_cb=progress_cb)
                     callees_and_refs.update(recursive_results)
 
         cref_ea = ida_xref.get_first_cref_from(current_item_ea)
@@ -306,7 +312,7 @@ def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edg
                         edges[target_ea][cref_ea].add('direct_call')
                     if cref_ea not in visited_eas:
                         callees_and_refs.add(cref_ea)
-                        recursive_results = find_callees_recursive(cref_ea, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types)
+                        recursive_results = find_callees_recursive(cref_ea, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types, progress_cb=progress_cb)
                         callees_and_refs.update(recursive_results)
             cref_ea = ida_xref.get_next_cref_from(current_item_ea, cref_ea)
 
@@ -319,7 +325,7 @@ def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edg
                         edges[target_ea][dref_ea].add('data_ref')
                     if dref_ea not in visited_eas:
                         callees_and_refs.add(dref_ea)
-                        recursive_results = find_callees_recursive(dref_ea, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types)
+                        recursive_results = find_callees_recursive(dref_ea, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types, progress_cb=progress_cb)
                         callees_and_refs.update(recursive_results)
             dref_ea = ida_xref.get_next_dref_from(current_item_ea, dref_ea)
 
@@ -355,7 +361,7 @@ def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edg
                     if added:
                         if imm_val not in visited_eas:
                             callees_and_refs.add(imm_val)
-                            recursive_results = find_callees_recursive(imm_val, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types)
+                            recursive_results = find_callees_recursive(imm_val, current_depth + 1, max_depth, visited_eas, edges=edges, vtables=vtables, allowed_types=allowed_types, progress_cb=progress_cb)
                             callees_and_refs.update(recursive_results)
 
         next_ea = current_item_ea + insn_len
@@ -366,7 +372,7 @@ def find_callees_recursive(target_ea, current_depth, max_depth, visited_eas, edg
 
     return callees_and_refs
 
-def decompile_functions_main(eas_to_decompile):
+def decompile_functions_main(eas_to_decompile, progress_cb: Optional[Callable[[str], None]] = None):
     results = {}
     total = len(eas_to_decompile)
     count = 0
@@ -379,7 +385,8 @@ def decompile_functions_main(eas_to_decompile):
     for func_ea in sorted_eas_list:
         count += 1
         func_name = ida_name.get_name(func_ea) or f"sub_{func_ea:X}"
-        ida_kernwin.replace_wait_box(f"Decompiling {count}/{total}: {func_name}")
+        if progress_cb:
+            progress_cb(f"Decompiling {count}/{total}: {func_name}")
         try:
             cfunc = ida_hexrays.decompile(func_ea)
             if cfunc:
@@ -393,14 +400,7 @@ def decompile_functions_main(eas_to_decompile):
             traceback.print_exc()
     return results
 
-def disassemble_functions_main(eas_to_disasm) -> Dict[int, List[Tuple[str, int, str]]]:
-    """
-    Disassemble the functions identified by 'eas_to_disasm' and return a dict:
-      ea -> list of tuples (kind, ea, text) where kind ∈ {'label','inst'}.
-    For 'label' entries, 'ea' is the address of the label (0 for function header label).
-    For 'inst' entries, 'ea' is the instruction EA, and 'text' is the disassembly for that item.
-    Runs in the IDA main thread via execute_sync (caller responsibility).
-    """
+def disassemble_functions_main(eas_to_disasm, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[int, List[Tuple[str, int, str]]]:
     results: Dict[int, List[Tuple[str, int, str]]] = {}
     total = len(eas_to_disasm)
     count = 0
@@ -408,24 +408,22 @@ def disassemble_functions_main(eas_to_disasm) -> Dict[int, List[Tuple[str, int, 
     for func_ea in sorted_eas_list:
         count += 1
         func_name = ida_name.get_name(func_ea) or f"sub_{func_ea:X}"
-        ida_kernwin.replace_wait_box(f"Disassembling {count}/{total}: {func_name}")
+        if progress_cb:
+            progress_cb(f"Disassembling {count}/{total}: {func_name}")
         func = ida_funcs.get_func(func_ea)
         if not func:
             results[func_ea] = [("label", 0, f"; Disassembly FAILED for {func_name} (0x{func_ea:X}) - no function at address")]
             continue
         lines: List[Tuple[str, int, str]] = []
-        # Emit a function header label for readability in the ASM body.
         lines.append(("label", 0, f"{func_name}:"))
         try:
             for ea in idautils.FuncItems(func_ea):
-                # Insert a local label if this address has a visible name (e.g., 'loc_...' labels).
                 try:
                     lab = ida_name.get_name(ea) or ""
                 except Exception:
                     lab = ""
                 if lab and ea != func_ea:
                     lines.append(("label", ea, f"{lab}:"))
-                # Preferred disassembly line generation (with tag removal).
                 s = None
                 try:
                     s = ida_lines.generate_disasm_line(ea, 0)
@@ -477,22 +475,11 @@ def _augment_edges_with_ctree_calls(fs_summaries: Dict[int, FunctionSummary], ed
 def write_code_file(output_file_path, decompiled_results, start_func_eas, caller_depth, callee_depth, edges, fs_summaries: Dict[int, FunctionSummary], max_chars=0):
     num_funcs_written = 0
     try:
-        name_map_container = [{}]
         eas_to_get_names = list(decompiled_results.keys())
-
-        def get_names_main(eas, container):
-            names = {}
-            for ea in eas:
-                names[ea] = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
-            container[0] = names
-            return 1
-
-        sync_status = ida_kernwin.execute_sync(lambda: get_names_main(eas_to_get_names, name_map_container), ida_kernwin.MFF_READ)
-        name_map = name_map_container[0] if sync_status == 1 else {ea: f"sub_{ea:X}" for ea in eas_to_get_names}
+        name_map = {ea: ida_funcs.get_func_name(ea) or f"sub_{ea:X}" for ea in eas_to_get_names}
 
         all_nodes = set(decompiled_results.keys())
 
-        # Augment edges with ctree-derived direct calls (catches PLT/IAT like strcpy)
         _augment_edges_with_ctree_calls(fs_summaries, edges)
 
         out_degrees = [(len(edges[ea]), ea) for ea in all_nodes]
@@ -625,30 +612,16 @@ def write_code_file(output_file_path, decompiled_results, start_func_eas, caller
     except Exception as e:
         traceback.print_exc()
         error_msg = f"{PLUGIN_NAME}: Error writing dump file:\n{e}"
-        ida_kernwin.execute_ui_requests([lambda msg=error_msg: ida_kernwin.warning(msg)])
+        ida_kernwin.warning(msg=error_msg)
         return 0
 
 def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int, str]]],
                    start_func_eas, caller_depth, callee_depth, edges,
                    fs_summaries: Dict[int, FunctionSummary], max_chars=0):
-    """
-    Write an ASM dump mirroring the structure & ordering of write_code_file.
-    Inject per-instruction @PTN hints inline (as trailing // comments or separate comment lines).
-    """
     num_funcs_written = 0
     try:
-        name_map_container = [{}]
         eas_to_get_names = list(asm_results.keys())
-
-        def get_names_main(eas, container):
-            names = {}
-            for ea in eas:
-                names[ea] = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
-            container[0] = names
-            return 1
-
-        sync_status = ida_kernwin.execute_sync(lambda: get_names_main(eas_to_get_names, name_map_container), ida_kernwin.MFF_READ)
-        name_map = name_map_container[0] if sync_status == 1 else {ea: f"sub_{ea:X}" for ea in eas_to_get_names}
+        name_map = {ea: ida_funcs.get_func_name(ea) or f"sub_{ea:X}" for ea in eas_to_get_names}
 
         all_nodes = set(asm_results.keys())
 
@@ -660,7 +633,6 @@ def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int,
 
         ptn = PTNEmitter(fs_summaries)
         per_func_ann = ptn.per_function_annotations(max(1, callee_depth))
-        # Per-instruction hints: fea -> {ea -> [hint_str_without_comment_prefix]}
         per_inst_hints = ptn.per_instruction_hints(max(1, callee_depth))
 
         def format_asm_with_hints(func_ea: int, items: List[Tuple[str, int, str]]) -> str:
@@ -670,11 +642,9 @@ def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int,
                 if kind == "label":
                     lines_out.append(text)
                     continue
-                # 'inst' line
                 line = f"0x{ea:X}: {text}"
                 hints = hint_map.get(ea, [])
                 if hints:
-                    # Emit instruction, then per-hint short comment lines for readability
                     lines_out.append(line)
                     for h in hints:
                         lines_out.append(f"    // {h}")
@@ -682,7 +652,6 @@ def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int,
                     lines_out.append(line)
             return "\n".join(lines_out)
 
-        # Prepare blocks (including sizing with max_chars)
         included_eas = set(all_nodes)
         removed_eas = set()
         func_text_cache: Dict[int, str] = {}
@@ -807,29 +776,14 @@ def write_asm_file(output_file_path, asm_results: Dict[int, List[Tuple[str, int,
     except Exception as e:
         traceback.print_exc()
         error_msg = f"{PLUGIN_NAME}: Error writing ASM file:\n{e}"
-        ida_kernwin.execute_ui_requests([lambda msg=error_msg: ida_kernwin.warning(msg)])
+        ida_kernwin.warning(msg=error_msg)
         return 0
 
 def write_dot_file(output_file_path, edges, all_nodes, start_func_eas, caller_depth, callee_depth):
     num_nodes_written = 0
     try:
-        name_map = {}
-        name_map_container = [{}]
         eas_to_get_names = list(all_nodes)
-
-        def get_names_main(eas, container):
-            names = {}
-            for ea in eas:
-                names[ea] = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
-            container[0] = names
-            return 1
-
-        sync_status = ida_kernwin.execute_sync(lambda: get_names_main(eas_to_get_names, name_map_container), ida_kernwin.MFF_READ)
-        if sync_status == 1:
-            name_map = name_map_container[0]
-        else:
-            for ea in eas_to_get_names:
-                name_map[ea] = f"sub_{ea:X}"
+        name_map = {ea: ida_funcs.get_func_name(ea) or f"sub_{ea:X}" for ea in eas_to_get_names}
 
         with open(output_file_path, "w", encoding="utf-8") as f:
             f.write(f"# DOT graph generated by {PLUGIN_NAME}\n")
@@ -881,7 +835,7 @@ def write_dot_file(output_file_path, edges, all_nodes, start_func_eas, caller_de
     except Exception as e:
         traceback.print_exc()
         error_msg = f"{PLUGIN_NAME}: Error writing DOT file:\n{e}"
-        ida_kernwin.execute_ui_requests([lambda msg=error_msg: ida_kernwin.warning(msg)])
+        ida_kernwin.warning(msg=error_msg)
         return 0
 
 def write_ptn_file(output_file_path, fs_summaries: Dict[int, FunctionSummary], start_func_eas: Set[int], callee_depth: int):
@@ -897,172 +851,108 @@ def write_ptn_file(output_file_path, fs_summaries: Dict[int, FunctionSummary], s
     except Exception as e:
         traceback.print_exc()
         error_msg = f"{PLUGIN_NAME}: Error writing PTN file:\n{e}"
-        ida_kernwin.execute_ui_requests([lambda msg=error_msg: ida_kernwin.warning(msg)])
+        ida_kernwin.warning(msg=error_msg)
         return 0
 
 def dump_task(start_func_eas, caller_depth, callee_depth, output_file_path, mode='code', xref_types=None, max_chars=0):
     if xref_types is None:
         xref_types = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
 
-    global g_multi_dump_active, g_dump_in_progress
+    global g_is_running
+    g_is_running = True
 
     start_func_names = []
-    start_names_container = [[]]
+    for ea in start_func_eas:
+        name = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
+        start_func_names.append(f"{name}(0x{ea:X})")
 
-    def get_start_names_main(eas, container):
-        names = []
-        for ea in eas:
-            name = ida_funcs.get_func_name(ea) or f"sub_{ea:X}"
-            names.append(f"{name}(0x{ea:X})")
-        container[0] = names
-        return 1
-
-    sync_status = ida_kernwin.execute_sync(lambda: get_start_names_main(start_func_eas, start_names_container), ida_kernwin.MFF_READ)
-    if sync_status == 1:
-        start_func_names = start_names_container[0]
-    print(f"{PLUGIN_NAME}: Background task for {len(start_func_eas)} function(s) mode={mode}: {', '.join(start_func_names) if start_func_names else ''}")
+    print(f"{PLUGIN_NAME}: Task for {len(start_func_eas)} function(s) mode={mode}: {', '.join(start_func_names) if start_func_names else ''}")
     print(f"  Callers={caller_depth}, Callees={callee_depth}, Output={output_file_path}")
     print(f"  Xref Types: {', '.join(sorted(xref_types))}")
     print(f"  Max Chars: {max_chars}")
 
+    ida_kernwin.show_wait_box(f"Finding callers/callees/refs for {len(start_func_eas)} functions...")
+
+    def update_progress(msg):
+        ida_kernwin.replace_wait_box(msg)
+        if ida_kernwin.user_cancelled():
+            raise OperationCancelled()
+
     try:
         all_nodes = set(start_func_eas)
         edges = defaultdict(lambda: defaultdict(set))
-        ida_kernwin.execute_ui_requests([lambda: ida_kernwin.show_wait_box(f"Finding callers/callees/refs for {len(start_func_eas)} functions...")])
 
         visited_callers = set()
         if caller_depth > 0:
-            caller_result_container = [set()]
-            visited_caller_container = [set()]
-
-            def run_find_multi_callers_main(container, visited_set_container, edges, allowed_types):
-                combined_callers = set()
-                for start_ea in start_func_eas:
-                    found = find_callers_recursive(start_ea, 1, caller_depth, visited_set_container[0], edges=edges, allowed_types=allowed_types)
-                    combined_callers.update(found)
-                container[0] = combined_callers
-                return 1
-
-            sync_status = ida_kernwin.execute_sync(lambda: run_find_multi_callers_main(caller_result_container, visited_caller_container, edges, xref_types), ida_kernwin.MFF_READ)
-            if sync_status == 1:
-                total_caller_eas = caller_result_container[0]
-                visited_callers = visited_caller_container[0]
-                all_nodes |= visited_callers
-                all_nodes.update(total_caller_eas)
-            else:
-                ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
-                ida_kernwin.warning(f"{PLUGIN_NAME}: Failed to find callers.")
-                return
+            combined_callers = set()
+            for start_ea in start_func_eas:
+                found = find_callers_recursive(start_ea, 1, caller_depth, visited_callers, edges=edges, allowed_types=xref_types, progress_cb=update_progress)
+                combined_callers.update(found)
+            all_nodes |= visited_callers
+            all_nodes.update(combined_callers)
 
         visited_callees = set()
         if callee_depth > 0:
-            callee_result_container = [set()]
-            visited_callee_container = [set()]
-
-            def run_find_multi_callees_main(container, visited_set_container, edges, allowed_types):
-                combined_callees = set()
-                vtables = find_vtables()
-                for start_ea in start_func_eas:
-                    found = find_callees_recursive(start_ea, 1, callee_depth, visited_set_container[0], edges=edges, vtables=vtables, allowed_types=allowed_types)
-                    combined_callees.update(found)
-                container[0] = combined_callees
-                return 1
-
-            sync_status = ida_kernwin.execute_sync(lambda: run_find_multi_callees_main(callee_result_container, visited_callee_container, edges, xref_types), ida_kernwin.MFF_READ)
-            if sync_status == 1:
-                total_callee_ref_eas = callee_result_container[0]
-                visited_callees = visited_callee_container[0]
-                all_nodes |= visited_callees
-                all_nodes.update(total_callee_ref_eas)
-            else:
-                ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
-                ida_kernwin.warning(f"{PLUGIN_NAME}: Failed to find callees/refs.")
-                return
+            combined_callees = set()
+            vtables = find_vtables()
+            for start_ea in start_func_eas:
+                found = find_callees_recursive(start_ea, 1, callee_depth, visited_callees, edges=edges, vtables=vtables, allowed_types=xref_types, progress_cb=update_progress)
+                combined_callees.update(found)
+            all_nodes |= visited_callees
+            all_nodes.update(combined_callees)
 
         total_nodes = len(all_nodes)
         if total_nodes == 0:
-            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            ida_kernwin.hide_wait_box()
             ida_kernwin.warning(f"{PLUGIN_NAME}: No functions/nodes found.")
             return
 
-        fs_summaries_container = [{}]
-        def run_analyze_main(container, eas):
-            try:
-                container[0] = analyze_functions_ctree(eas)
-                return 1
-            except Exception:
-                traceback.print_exc()
-                container[0] = {}
-                return 0
+        update_progress(f"Analyzing {total_nodes} functions...")
+        fs_summaries = analyze_functions_ctree(all_nodes, progress_cb=update_progress)
 
-        analyze_status = ida_kernwin.execute_sync(lambda: run_analyze_main(fs_summaries_container, all_nodes), ida_kernwin.MFF_READ)
-        fs_summaries: Dict[int, FunctionSummary] = fs_summaries_container[0] if analyze_status == 1 else {}
-
+        num_written = 0
         if mode == 'code':
-            decompiled_results = {}
-            decomp_result_container = [{}]
-            def run_decompile_main(container, eas):
-                try:
-                    container[0] = decompile_functions_main(eas)
-                    return 1
-                except Exception:
-                    traceback.print_exc()
-                    container[0] = {}
-                    return 0
-            sync_status = ida_kernwin.execute_sync(lambda: run_decompile_main(decomp_result_container, all_nodes), ida_kernwin.MFF_WRITE)
-            if sync_status == 1:
-                decompiled_results = decomp_result_container[0]
-            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            decompiled_results = decompile_functions_main(all_nodes, progress_cb=update_progress)
+            ida_kernwin.hide_wait_box()
             num_written = write_code_file(output_file_path, decompiled_results, start_func_eas, caller_depth, callee_depth, edges, fs_summaries, max_chars=max_chars)
 
         elif mode == 'graph':
-            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            ida_kernwin.hide_wait_box()
             num_written = write_dot_file(output_file_path, edges, all_nodes, start_func_eas, caller_depth, callee_depth)
 
         elif mode == 'ptn':
-            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            ida_kernwin.hide_wait_box()
             num_written = write_ptn_file(output_file_path, fs_summaries, set(all_nodes), callee_depth=max(1, callee_depth))
 
         elif mode == 'asm':
-            asm_result_container = [{}]
-            def run_disasm_main(container, eas):
-                try:
-                    container[0] = disassemble_functions_main(eas)
-                    return 1
-                except Exception:
-                    traceback.print_exc()
-                    container[0] = {}
-                    return 0
-            sync_status = ida_kernwin.execute_sync(lambda: run_disasm_main(asm_result_container, all_nodes), ida_kernwin.MFF_READ)
-            asm_results = asm_result_container[0] if sync_status == 1 else {}
-            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            asm_results = disassemble_functions_main(all_nodes, progress_cb=update_progress)
+            ida_kernwin.hide_wait_box()
             num_written = write_asm_file(output_file_path, asm_results, start_func_eas, caller_depth, callee_depth, edges, fs_summaries, max_chars=max_chars)
 
         else:
-            ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+            ida_kernwin.hide_wait_box()
             ida_kernwin.warning(f"{PLUGIN_NAME}: Unknown mode '{mode}'.")
             return
 
         if num_written > 0:
             type_str = "functions" if mode in ('code', 'asm') else ("nodes" if mode == 'graph' else "bytes")
             final_message = f"{PLUGIN_NAME}: Successfully wrote {num_written} {type_str} to:\n{output_file_path}"
-            ida_kernwin.execute_sync(lambda: (ida_kernwin.info(final_message), 1)[1], ida_kernwin.MFF_WRITE)
+            ida_kernwin.info(final_message)
 
+    except OperationCancelled:
+        ida_kernwin.hide_wait_box()
+        ida_kernwin.warning(f"{PLUGIN_NAME}: Operation cancelled by user.")
     except Exception as e:
         traceback.print_exc()
-        ida_kernwin.execute_ui_requests([lambda: ida_kernwin.warning(f"{PLUGIN_NAME}: An unexpected error occurred.")])
-        ida_kernwin.execute_ui_requests([ida_kernwin.hide_wait_box])
+        ida_kernwin.hide_wait_box()
+        ida_kernwin.warning(f"{PLUGIN_NAME}: An unexpected error occurred:\n{e}")
     finally:
-        with g_dump_lock:
-            if len(start_func_eas) == 1:
-                g_dump_in_progress.discard(list(start_func_eas)[0])
-            else:
-                global g_multi_dump_active
-                g_multi_dump_active = False
+        g_is_running = False
+        ida_kernwin.hide_wait_box()
 
 class DumpCtxActionHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
-        global g_dump_in_progress, g_multi_dump_active
+        global g_is_running
         widget = ctx.widget
         widget_type = ida_kernwin.get_widget_type(widget)
         if widget_type != ida_kernwin.BWN_PSEUDOCODE:
@@ -1073,52 +963,41 @@ class DumpCtxActionHandler(ida_kernwin.action_handler_t):
             return 1
         start_func_ea = vu.cfunc.entry_ea
         start_func_name = ida_funcs.get_func_name(start_func_ea) or f"sub_{start_func_ea:X}"
-        with g_dump_lock:
-            if start_func_ea in g_dump_in_progress:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: Dump already running for {start_func_name}.")
-                return 1
-            if g_multi_dump_active:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: A multi-function dump is currently running.")
-                return 1
-            g_dump_in_progress.add(start_func_ea)
+
+        if g_is_running:
+            ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running.")
+            return 1
+
         input_results = {"caller_depth": -1, "callee_depth": -1, "output_file": None, "xref_types": None, "max_chars": 0}
-        input_container = [input_results]
-        def get_inputs_main(container):
-            c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
-            if c_depth is None: return 0
-            container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
-            ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
-            if ca_depth is None: return 0
-            container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
-            xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
-                                                         "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
-            if xref_types_str is None: return 0
-            if xref_types_str.strip().lower() == 'all':
-                container[0]["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
-            else:
-                container[0]["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
-            m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
-            if m_chars is None: return 0
-            container[0]["max_chars"] = int(m_chars) if m_chars >= 0 else 0
-            default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_dump_callers{c_depth}_callees{ca_depth}.c")
-            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output C File")
-            if not output_file: return 0
-            container[0]["output_file"] = output_file
-            return 1
-        sync_status = ida_kernwin.execute_sync(lambda: get_inputs_main(input_container), ida_kernwin.MFF_WRITE)
-        final_inputs = input_container[0]
-        caller_depth = final_inputs["caller_depth"]
-        callee_depth = final_inputs["callee_depth"]
-        output_file_path = final_inputs["output_file"]
-        xref_types = final_inputs["xref_types"]
-        max_chars = final_inputs["max_chars"]
-        if sync_status != 1 or caller_depth < 0 or callee_depth < 0 or not output_file_path or not xref_types:
-            with g_dump_lock:
-                g_dump_in_progress.discard(start_func_ea)
-            return 1
-        task_thread = threading.Thread(target=dump_task, args=(set([start_func_ea]), caller_depth, callee_depth, output_file_path, 'code', xref_types, max_chars))
-        task_thread.start()
+
+        c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
+        if c_depth is None: return 0
+        input_results["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
+
+        ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
+        if ca_depth is None: return 0
+        input_results["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
+
+        xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
+                                                     "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
+        if xref_types_str is None: return 0
+        if xref_types_str.strip().lower() == 'all':
+            input_results["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+        else:
+            input_results["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
+
+        m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
+        if m_chars is None: return 0
+        input_results["max_chars"] = int(m_chars) if m_chars >= 0 else 0
+
+        default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_dump_callers{c_depth}_callees{ca_depth}.c")
+        output_file = ida_kernwin.ask_file(True, default_filename, "Select Output C File")
+        if not output_file: return 0
+        input_results["output_file"] = output_file
+
+        dump_task(set([start_func_ea]), input_results["caller_depth"], input_results["callee_depth"], input_results["output_file"], 'code', input_results["xref_types"], input_results["max_chars"])
         return 1
+
     def update(self, ctx):
         if ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE:
             vu = ida_hexrays.get_widget_vdui(ctx.widget)
@@ -1128,7 +1007,7 @@ class DumpCtxActionHandler(ida_kernwin.action_handler_t):
 
 class DumpDotCtxActionHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
-        global g_dump_in_progress, g_multi_dump_active
+        global g_is_running
         widget = ctx.widget
         widget_type = ida_kernwin.get_widget_type(widget)
         if widget_type != ida_kernwin.BWN_PSEUDOCODE:
@@ -1139,53 +1018,41 @@ class DumpDotCtxActionHandler(ida_kernwin.action_handler_t):
             return 1
         start_func_ea = vu.cfunc.entry_ea
         start_func_name = ida_funcs.get_func_name(start_func_ea) or f"sub_{start_func_ea:X}"
-        with g_dump_lock:
-            if start_func_ea in g_dump_in_progress:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running for {start_func_name}.")
-                return 1
-            if g_multi_dump_active:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: A multi-function operation is currently running.")
-                return 1
-            g_dump_in_progress.add(start_func_ea)
+
+        if g_is_running:
+            ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running.")
+            return 1
 
         input_results = {"caller_depth": -1, "callee_depth": -1, "output_file": None, "xref_types": None, "max_chars": 0}
-        input_container = [input_results]
-        def get_inputs_main(container):
-            c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
-            if c_depth is None: return 0
-            container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
-            ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
-            if ca_depth is None: return 0
-            container[0]["callee_depth"] = int(ca_depth) if c_depth >= 0 else 0
-            xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
-                                                         "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
-            if xref_types_str is None: return 0
-            if xref_types_str.strip().lower() == 'all':
-                container[0]["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
-            else:
-                container[0]["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
-            m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
-            if m_chars is None: return 0
-            container[0]["max_chars"] = int(m_chars) if m_chars >= 0 else 0
-            default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_graph_callers{c_depth}_callees{ca_depth}.dot")
-            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output DOT File")
-            if not output_file: return 0
-            container[0]["output_file"] = output_file
-            return 1
-        sync_status = ida_kernwin.execute_sync(lambda: get_inputs_main(input_container), ida_kernwin.MFF_WRITE)
-        final_inputs = input_container[0]
-        caller_depth = final_inputs["caller_depth"]
-        callee_depth = final_inputs["callee_depth"]
-        output_file_path = final_inputs["output_file"]
-        xref_types = final_inputs["xref_types"]
-        max_chars = final_inputs["max_chars"]
-        if sync_status != 1 or caller_depth < 0 or callee_depth < 0 or not output_file_path or not xref_types:
-            with g_dump_lock:
-                g_dump_in_progress.discard(start_func_ea)
-            return 1
-        task_thread = threading.Thread(target=dump_task, args=(set([start_func_ea]), caller_depth, callee_depth, output_file_path, 'graph', xref_types, max_chars))
-        task_thread.start()
+
+        c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
+        if c_depth is None: return 0
+        input_results["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
+
+        ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
+        if ca_depth is None: return 0
+        input_results["callee_depth"] = int(ca_depth) if c_depth >= 0 else 0
+
+        xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
+                                                     "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
+        if xref_types_str is None: return 0
+        if xref_types_str.strip().lower() == 'all':
+            input_results["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+        else:
+            input_results["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
+
+        m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
+        if m_chars is None: return 0
+        input_results["max_chars"] = int(m_chars) if m_chars >= 0 else 0
+
+        default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_graph_callers{c_depth}_callees{ca_depth}.dot")
+        output_file = ida_kernwin.ask_file(True, default_filename, "Select Output DOT File")
+        if not output_file: return 0
+        input_results["output_file"] = output_file
+
+        dump_task(set([start_func_ea]), input_results["caller_depth"], input_results["callee_depth"], input_results["output_file"], 'graph', input_results["xref_types"], input_results["max_chars"])
         return 1
+
     def update(self, ctx):
         if ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE:
             vu = ida_hexrays.get_widget_vdui(ctx.widget)
@@ -1195,7 +1062,7 @@ class DumpDotCtxActionHandler(ida_kernwin.action_handler_t):
 
 class DumpPTNCtxActionHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
-        global g_dump_in_progress, g_multi_dump_active
+        global g_is_running
         widget = ctx.widget
         widget_type = ida_kernwin.get_widget_type(widget)
         if widget_type != ida_kernwin.BWN_PSEUDOCODE:
@@ -1206,38 +1073,25 @@ class DumpPTNCtxActionHandler(ida_kernwin.action_handler_t):
             return 1
         start_func_ea = vu.cfunc.entry_ea
         start_func_name = ida_funcs.get_func_name(start_func_ea) or f"sub_{start_func_ea:X}"
-        with g_dump_lock:
-            if start_func_ea in g_dump_in_progress:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running for {start_func_name}.")
-                return 1
-            if g_multi_dump_active:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: A multi-function operation is currently running.")
-                return 1
-            g_dump_in_progress.add(start_func_ea)
+
+        if g_is_running:
+            ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running.")
+            return 1
 
         input_results = {"caller_depth": -1, "callee_depth": -1, "output_file": None}
-        input_container = [input_results]
-        def get_inputs_main(container):
-            ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth for PTN (e.g., 1, 2)")
-            if ca_depth is None: return 0
-            container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 1 else 1
-            default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_provenance.ptn")
-            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output PTN File (.ptn or .json)")
-            if not output_file: return 0
-            container[0]["output_file"] = output_file
-            container[0]["caller_depth"] = 0
-            return 1
-        sync_status = ida_kernwin.execute_sync(lambda: get_inputs_main(input_container), ida_kernwin.MFF_WRITE)
-        final_inputs = input_container[0]
-        callee_depth = final_inputs["callee_depth"]
-        output_file_path = final_inputs["output_file"]
-        if sync_status != 1 or callee_depth < 1 or not output_file_path:
-            with g_dump_lock:
-                g_dump_in_progress.discard(start_func_ea)
-            return 1
-        task_thread = threading.Thread(target=dump_task, args=(set([start_func_ea]), 0, callee_depth, output_file_path, 'ptn', set(), 0))
-        task_thread.start()
+
+        ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth for PTN (e.g., 1, 2)")
+        if ca_depth is None: return 0
+        input_results["callee_depth"] = int(ca_depth) if ca_depth >= 1 else 1
+
+        default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_provenance.ptn")
+        output_file = ida_kernwin.ask_file(True, default_filename, "Select Output PTN File (.ptn or .json)")
+        if not output_file: return 0
+        input_results["output_file"] = output_file
+
+        dump_task(set([start_func_ea]), 0, input_results["callee_depth"], input_results["output_file"], 'ptn', set(), 0)
         return 1
+
     def update(self, ctx):
         if ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE:
             vu = ida_hexrays.get_widget_vdui(ctx.widget)
@@ -1256,18 +1110,11 @@ class CopyPTNVarCtxActionHandler(ida_kernwin.action_handler_t):
             return 1
         func_ea = vu.cfunc.entry_ea
 
-        fs_container = [None]
-        def run_collect_current_fs(container):
-            try:
-                container[0] = analyze_functions_ctree([func_ea]).get(func_ea)
-                return 1
-            except Exception:
-                traceback.print_exc()
-                container[0] = None
-                return 0
-
-        ida_kernwin.execute_sync(lambda: run_collect_current_fs(fs_container), ida_kernwin.MFF_READ)
-        fs = fs_container[0]
+        fs = None
+        try:
+            fs = analyze_functions_ctree([func_ea]).get(func_ea)
+        except Exception:
+            traceback.print_exc()
 
         if not fs:
             ida_kernwin.warning(f"{PLUGIN_NAME}: Could not compute provenance for current function.")
@@ -1304,7 +1151,7 @@ class CopyPTNVarCtxActionHandler(ida_kernwin.action_handler_t):
 
 class DumpAsmCtxActionHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
-        global g_dump_in_progress, g_multi_dump_active
+        global g_is_running
         widget = ctx.widget
         widget_type = ida_kernwin.get_widget_type(widget)
         if widget_type != ida_kernwin.BWN_PSEUDOCODE:
@@ -1315,53 +1162,41 @@ class DumpAsmCtxActionHandler(ida_kernwin.action_handler_t):
             return 1
         start_func_ea = vu.cfunc.entry_ea
         start_func_name = ida_funcs.get_func_name(start_func_ea) or f"sub_{start_func_ea:X}"
-        with g_dump_lock:
-            if start_func_ea in g_dump_in_progress:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running for {start_func_name}.")
-                return 1
-            if g_multi_dump_active:
-                ida_kernwin.warning(f"{PLUGIN_NAME}: A multi-function operation is currently running.")
-                return 1
-            g_dump_in_progress.add(start_func_ea)
+
+        if g_is_running:
+            ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running.")
+            return 1
 
         input_results = {"caller_depth": -1, "callee_depth": -1, "output_file": None, "xref_types": None, "max_chars": 0}
-        input_container = [input_results]
-        def get_inputs_main(container):
-            c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
-            if c_depth is None: return 0
-            container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
-            ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
-            if ca_depth is None: return 0
-            container[0]["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
-            xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
-                                                         "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
-            if xref_types_str is None: return 0
-            if xref_types_str.strip().lower() == 'all':
-                container[0]["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
-            else:
-                container[0]["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
-            m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
-            if m_chars is None: return 0
-            container[0]["max_chars"] = int(m_chars) if m_chars >= 0 else 0
-            default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_asm_callers{c_depth}_callees{ca_depth}.asm")
-            output_file = ida_kernwin.ask_file(True, default_filename, "Select Output ASM File")
-            if not output_file: return 0
-            container[0]["output_file"] = output_file
-            return 1
-        sync_status = ida_kernwin.execute_sync(lambda: get_inputs_main(input_container), ida_kernwin.MFF_WRITE)
-        final_inputs = input_container[0]
-        caller_depth = final_inputs["caller_depth"]
-        callee_depth = final_inputs["callee_depth"]
-        output_file_path = final_inputs["output_file"]
-        xref_types = final_inputs["xref_types"]
-        max_chars = final_inputs["max_chars"]
-        if sync_status != 1 or caller_depth < 0 or callee_depth < 0 or not output_file_path or not xref_types:
-            with g_dump_lock:
-                g_dump_in_progress.discard(start_func_ea)
-            return 1
-        task_thread = threading.Thread(target=dump_task, args=(set([start_func_ea]), caller_depth, callee_depth, output_file_path, 'asm', xref_types, max_chars))
-        task_thread.start()
+
+        c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
+        if c_depth is None: return 0
+        input_results["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
+
+        ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
+        if ca_depth is None: return 0
+        input_results["callee_depth"] = int(ca_depth) if ca_depth >= 0 else 0
+
+        xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
+                                                     "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
+        if xref_types_str is None: return 0
+        if xref_types_str.strip().lower() == 'all':
+            input_results["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+        else:
+            input_results["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
+
+        m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
+        if m_chars is None: return 0
+        input_results["max_chars"] = int(m_chars) if m_chars >= 0 else 0
+
+        default_filename = re.sub(r'[<>:"/\\|?*]', '_', f"{start_func_name}_asm_callers{c_depth}_callees{ca_depth}.asm")
+        output_file = ida_kernwin.ask_file(True, default_filename, "Select Output ASM File")
+        if not output_file: return 0
+        input_results["output_file"] = output_file
+
+        dump_task(set([start_func_ea]), input_results["caller_depth"], input_results["callee_depth"], input_results["output_file"], 'asm', input_results["xref_types"], input_results["max_chars"])
         return 1
+
     def update(self, ctx):
         if ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE:
             vu = ida_hexrays.get_widget_vdui(ctx.widget)
@@ -1370,104 +1205,88 @@ class DumpAsmCtxActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 def perform_multi_dump(mode):
-    global g_dump_in_progress, g_multi_dump_active
-    with g_dump_lock:
-        if g_multi_dump_active:
-            ida_kernwin.warning(f"{PLUGIN_NAME}: A multi-function operation is already running.")
-            return
-        if g_dump_in_progress:
-            ida_kernwin.warning(f"{PLUGIN_NAME}: One or more single function operations are running.")
-            return
-        g_multi_dump_active = True
+    global g_is_running
+    if g_is_running:
+        ida_kernwin.warning(f"{PLUGIN_NAME}: Operation already running.")
+        return
 
     input_results = {"start_eas": set(), "caller_depth": -1, "callee_depth": -1, "output_file": None, "xref_types": None, "max_chars": 0}
-    input_container = [input_results]
 
-    def get_multi_inputs_main(container, mode):
-        func_list_str = ida_kernwin.ask_str("", 0, "Enter comma-separated function names or addresses (e.g., sub_123, 0x401000, MyFunc)")
-        if not func_list_str:
-            return 0
-        start_eas = set()
-        unresolved = []
-        items = [item.strip() for item in func_list_str.split(',') if item.strip()]
-        if not items:
-            ida_kernwin.warning(f"{PLUGIN_NAME}: No function names or addresses provided.")
-            return 0
-        for item in items:
-            ea = idaapi.BADADDR
-            if item.lower().startswith("0x"):
-                try:
-                    ea = int(item, 16)
-                except ValueError:
-                    pass
-            elif item.isdigit():
-                try:
-                    ea = int(item)
-                except ValueError:
-                    pass
-            if ea == idaapi.BADADDR:
-                ea = ida_name.get_name_ea(idaapi.BADADDR, item)
-            if ea != idaapi.BADADDR and ida_funcs.get_func(ea):
-                start_eas.add(ea)
-            else:
-                unresolved.append(item)
-        if unresolved:
-            ida_kernwin.warning(f"{PLUGIN_NAME}: Could not resolve or find functions:\n" + "\n".join(unresolved))
-        if not start_eas:
-            ida_kernwin.warning(f"{PLUGIN_NAME}: No valid functions found.")
-            return 0
-        container[0]["start_eas"] = start_eas
-        c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
-        if c_depth is None: return 0
-        container[0]["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
-        ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
-        if ca_depth is None: return 0
-        container[0]["callee_depth"] = int(ca_depth) if c_depth >= 0 else 0
-        xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
-                                                     "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
-        if xref_types_str is None:
-            return 0
-        if xref_types_str.strip().lower() == 'all':
-            container[0]["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
-        else:
-            container[0]["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
-        m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
-        if m_chars is None: return 0
-        container[0]["max_chars"] = int(m_chars) if m_chars >= 0 else 0
-        first_func_ea = sorted(list(start_eas))[0]
-        first_func_name = ida_funcs.get_func_name(first_func_ea) or f"sub_{first_func_ea:X}"
-        if mode == 'code':
-            default_filename = f"multi_dump_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.c"
-            title = "Select Output C File"
-        elif mode == 'ptn':
-            default_filename = f"multi_ptn_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.ptn"
-            title = "Select Output PTN File"
-        elif mode == 'asm':
-            default_filename = f"multi_asm_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.asm"
-            title = "Select Output ASM File"
-        else:
-            default_filename = f"multi_graph_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.dot"
-            title = "Select Output DOT File"
-        default_filename = re.sub(r'[<>:"/\\|?*]', '_', default_filename)
-        output_file = ida_kernwin.ask_file(True, default_filename, title)
-        if not output_file: return 0
-        container[0]["output_file"] = output_file
-        return 1
-
-    sync_status = ida_kernwin.execute_sync(lambda: get_multi_inputs_main(input_container, mode), ida_kernwin.MFF_WRITE)
-    final_inputs = input_container[0]
-    start_eas = final_inputs["start_eas"]
-    caller_depth = final_inputs["caller_depth"]
-    callee_depth = final_inputs["callee_depth"]
-    output_file_path = final_inputs["output_file"]
-    xref_types = final_inputs["xref_types"]
-    max_chars = final_inputs["max_chars"]
-    if sync_status != 1 or not start_eas or caller_depth < 0 or callee_depth < 0 or not output_file_path or (mode != 'ptn' and not xref_types):
-        with g_dump_lock:
-            g_multi_dump_active = False
+    func_list_str = ida_kernwin.ask_str("", 0, "Enter comma-separated function names or addresses (e.g., sub_123, 0x401000, MyFunc)")
+    if not func_list_str:
         return
-    task_thread = threading.Thread(target=dump_task, args=(start_eas, caller_depth, callee_depth, output_file_path, mode, xref_types or set(), max_chars))
-    task_thread.start()
+    start_eas = set()
+    unresolved = []
+    items = [item.strip() for item in func_list_str.split(',') if item.strip()]
+    if not items:
+        ida_kernwin.warning(f"{PLUGIN_NAME}: No function names or addresses provided.")
+        return
+    for item in items:
+        ea = idaapi.BADADDR
+        if item.lower().startswith("0x"):
+            try:
+                ea = int(item, 16)
+            except ValueError:
+                pass
+        elif item.isdigit():
+            try:
+                ea = int(item)
+            except ValueError:
+                pass
+        if ea == idaapi.BADADDR:
+            ea = ida_name.get_name_ea(idaapi.BADADDR, item)
+        if ea != idaapi.BADADDR and ida_funcs.get_func(ea):
+            start_eas.add(ea)
+        else:
+            unresolved.append(item)
+    if unresolved:
+        ida_kernwin.warning(f"{PLUGIN_NAME}: Could not resolve or find functions:\n" + "\n".join(unresolved))
+    if not start_eas:
+        ida_kernwin.warning(f"{PLUGIN_NAME}: No valid functions found.")
+        return
+    input_results["start_eas"] = start_eas
+
+    c_depth = ida_kernwin.ask_long(0, "Enter Caller Depth (e.g., 0, 1, 2)")
+    if c_depth is None: return
+    input_results["caller_depth"] = int(c_depth) if c_depth >= 0 else 0
+
+    ca_depth = ida_kernwin.ask_long(1, "Enter Callee/Ref Depth (e.g., 0, 1, 2)")
+    if ca_depth is None: return
+    input_results["callee_depth"] = int(ca_depth) if c_depth >= 0 else 0
+
+    xref_types_str = ida_kernwin.ask_str("all", 0, "Enter comma-separated xref types to include (or 'all'):\n"
+                                                 "direct_call,indirect_call,data_ref,immediate_ref,tail_call_push_ret,virtual_call,jump_table")
+    if xref_types_str is None:
+        return
+    if xref_types_str.strip().lower() == 'all':
+        input_results["xref_types"] = set(['direct_call', 'indirect_call', 'data_ref', 'immediate_ref', 'tail_call_push_ret', 'virtual_call', 'jump_table'])
+    else:
+        input_results["xref_types"] = set([t.strip() for t in xref_types_str.split(',') if t.strip()])
+
+    m_chars = ida_kernwin.ask_long(0, "Enter maximum characters for the output file (0 for no limit)")
+    if m_chars is None: return
+    input_results["max_chars"] = int(m_chars) if m_chars >= 0 else 0
+
+    first_func_ea = sorted(list(start_eas))[0]
+    first_func_name = ida_funcs.get_func_name(first_func_ea) or f"sub_{first_func_ea:X}"
+    if mode == 'code':
+        default_filename = f"multi_dump_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.c"
+        title = "Select Output C File"
+    elif mode == 'ptn':
+        default_filename = f"multi_ptn_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.ptn"
+        title = "Select Output PTN File"
+    elif mode == 'asm':
+        default_filename = f"multi_asm_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.asm"
+        title = "Select Output ASM File"
+    else:
+        default_filename = f"multi_graph_{first_func_name}_etc_callers{c_depth}_callees{ca_depth}.dot"
+        title = "Select Output DOT File"
+    default_filename = re.sub(r'[<>:"/\\|?*]', '_', default_filename)
+    output_file = ida_kernwin.ask_file(True, default_filename, title)
+    if not output_file: return
+    input_results["output_file"] = output_file
+
+    dump_task(start_eas, input_results["caller_depth"], input_results["callee_depth"], input_results["output_file"], mode, input_results["xref_types"] or set(), input_results["max_chars"])
 
 class DumpCodeMultiActionHandler(ida_kernwin.action_handler_t):
     def activate(self, ctx):
@@ -1603,10 +1422,8 @@ class CodeDumperPlugin(idaapi.plugin_t):
         for act in [ACTION_ID_CTX, ACTION_ID_DOT_CTX, ACTION_ID_PTN_CTX, ACTION_ID_PTN_COPY_CTX, ACTION_ID_CODE_MULTI, ACTION_ID_DOT_MULTI, ACTION_ID_PTN_MULTI, ACTION_ID_ASM_CTX, ACTION_ID_ASM_MULTI]:
             try: ida_kernwin.unregister_action(act)
             except Exception: pass
-        with g_dump_lock:
-            g_dump_in_progress.clear()
-            global g_multi_dump_active
-            g_multi_dump_active = False
+        global g_is_running
+        g_is_running = False
 
 def PLUGIN_ENTRY():
     return CodeDumperPlugin()
